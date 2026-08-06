@@ -315,6 +315,8 @@ exo supports several environment variables for configuration:
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
+| `EXO_ASTRID_STORE` | Opt in to durable MLX prefix-cache reuse through the optional Astrid adapter. | None |
+| `EXO_ASTRID_RUNTIME_PROFILE` | Exact semantic identity of the model closure, tokenizer/template, MLX runtime, cache schema, and shard plan. Required with `EXO_ASTRID_STORE`. | None |
 
 **Example usage:**
 
@@ -334,6 +336,33 @@ EXO_ENABLE_IMAGE_MODELS=true uv run exo
 # Use custom namespace for cluster isolation
 EXO_LIBP2P_NAMESPACE=my-dev-cluster uv run exo
 ```
+
+### Durable MLX prefix reuse with Astrid
+
+The optional Astrid adapter can retain completed MLX prefix computations across
+process restarts. A matching continuation restores the longest compatible
+checkpoint and prefills only the remaining suffix. Persistence is an
+accelerator: missing, corrupt, or unavailable storage falls back to ordinary
+inference and never invalidates a generated result.
+
+Install the adapter and opt in explicitly:
+
+```bash
+uv pip install ./integrations/astrid_store
+EXO_ASTRID_STORE="$HOME/.local/share/exo/astrid" \
+EXO_ASTRID_RUNTIME_PROFILE="gemma-model-closure-and-runtime-v1" \
+uv run exo
+```
+
+The runtime profile is a correctness boundary, not a display label. It must
+change whenever model weights, tokenizer or chat template, MLX numerical/cache
+semantics, device shard assignment, or relevant generation semantics change.
+Exo currently persists ordinary text KV caches only; vision inputs and models
+with media inputs remain on the normal uncached path. Complete SSM and rotating
+cache states may be restored at their exact checkpoint boundary; Exo still
+requires a live rollback snapshot before trimming inside such a checkpoint.
+See the [measured Gemma 4 benchmark](docs/benchmarks/astrid-prefix-reuse.md) for
+the end-to-end restart result and its claim boundaries.
 
 ---
 

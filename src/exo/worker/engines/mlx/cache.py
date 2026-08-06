@@ -27,6 +27,7 @@ from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
+    from exo.worker.engines.mlx.cache_persistence import KVPrefixPersistence
     from exo.worker.engines.mlx.vision import MediaRegion
 
 
@@ -230,7 +231,11 @@ def has_non_kv_caches(cache: KVCacheType) -> bool:
 
 
 class KVPrefixCache:
-    def __init__(self, group: mx.distributed.Group | None):
+    def __init__(
+        self,
+        group: mx.distributed.Group | None,
+        persistence: "KVPrefixPersistence | None" = None,
+    ):
         self.prompts: list[mx.array] = []  # mx array of tokens (ints)
         self.caches: list[KVCacheType] = []
         self._snapshots: list[list[CacheSnapshot] | None] = []
@@ -239,6 +244,31 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._access_counter: int = 0
         self._group = group
+        self._persistence = persistence
+
+    def _schedule_persistence(
+        self,
+        prompt_tokens: mx.array,
+        cache: KVCacheType,
+        snapshots: list[CacheSnapshot] | None,
+        media_regions: list["MediaRegion"],
+        prefill_tps: float,
+    ) -> None:
+        """Publish an accelerator checkpoint without coupling it to inference."""
+        if self._persistence is None:
+            return
+        try:
+            self._persistence.schedule_store(
+                prompt_tokens,
+                cache,
+                snapshots,
+                media_regions,
+                prefill_tps,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "KV cache persistence failed; inference result remains valid"
+            )
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -248,6 +278,13 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+
+    def close(self) -> None:
+        """Finish pending durable publication and release its resources."""
+        if self._persistence is None:
+            return
+        self._persistence.close()
+        self._persistence = None
 
     def add_kv_cache(
         self,
@@ -266,6 +303,13 @@ class KVPrefixCache:
         self.prefill_tps.append(prefill_tps)
         self._access_counter += 1
         self._last_used.append(self._access_counter)
+        self._schedule_persistence(
+            self.prompts[-1],
+            self.caches[-1],
+            self._snapshots[-1],
+            list(self._media_regions[-1]),
+            prefill_tps,
+        )
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
 
     def update_kv_cache(
@@ -293,6 +337,13 @@ class KVPrefixCache:
         self.prefill_tps[index] = prefill_tps
         self._access_counter += 1
         self._last_used[index] = self._access_counter
+        self._schedule_persistence(
+            self.prompts[index],
+            self.caches[index],
+            self._snapshots[index],
+            list(self._media_regions[index]),
+            prefill_tps,
+        )
         logger.info(f"KV cache updated (index {index}): {len(prompt_tokens)} tokens")
 
     def _get_snapshot(
@@ -357,6 +408,33 @@ class KVPrefixCache:
             if length > best_length:
                 best_index, best_length = i, length
 
+        if self._persistence is not None and not is_exact:
+            restored = self._persistence.restore_longest(
+                prompt_tokens,
+                best_length,
+                list(query_regions),
+            )
+            if restored is not None:
+                restored_length = get_prefix_length(
+                    prompt_tokens, restored.prompt_tokens
+                )
+                restored_length = self._validate_media_match(
+                    restored_length,
+                    restored.media_regions,
+                    query_regions,
+                )
+                if restored_length > best_length:
+                    self.prompts.append(restored.prompt_tokens)
+                    self.caches.append(restored.cache)
+                    self._snapshots.append(restored.snapshots)
+                    self._media_regions.append(restored.media_regions)
+                    self.prefill_tps.append(restored.prefill_tps)
+                    self._access_counter += 1
+                    self._last_used.append(self._access_counter)
+                    best_index = len(self.prompts) - 1
+                    best_length = restored_length
+                    is_exact = restored_length >= max_length - 1
+
         if best_index is None:
             return make_kv_cache(model), prompt_tokens, None, False
 
@@ -366,14 +444,18 @@ class KVPrefixCache:
         has_ssm = has_non_kv_caches(self.caches[best_index])
         cached_length = cache_length(self.caches[best_index])
         if has_ssm:
-            target = best_length
+            target = min(cached_length, best_length)
         else:
             desired = (max_length - 1) if is_exact else best_length
             target = min(cached_length, desired)
-        restore_pos, restore_snap = self._get_snapshot(best_index, target)
+        at_complete_boundary = target == cached_length
+        if has_ssm and at_complete_boundary:
+            restore_pos, restore_snap = target, None
+        else:
+            restore_pos, restore_snap = self._get_snapshot(best_index, target)
 
         # No usable snapshot — need fresh cache
-        if restore_snap is None and has_ssm:
+        if restore_snap is None and has_ssm and not at_complete_boundary:
             return make_kv_cache(model), prompt_tokens, None, False
 
         prompt_cache = deepcopy(self.caches[best_index])

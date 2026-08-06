@@ -20,6 +20,7 @@ from exo.worker.runner.llm_inference.batch_generator import (
 )
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
+from .astrid_persistence import configured_astrid_persistence
 from .cache import KVPrefixCache
 from .types import Model
 from .utils_mlx import (
@@ -38,9 +39,16 @@ class MlxBuilder(Builder):
     tokenizer: TokenizerWrapper | None = None
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
+    shard_profile: str | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
+        shard = bound_instance.bound_shard
+        self.shard_profile = (
+            f"type={type(shard).__name__};rank={shard.device_rank};"
+            f"world={shard.world_size};layers={shard.start_layer}:"
+            f"{shard.end_layer}:{shard.n_layers}"
+        )
 
     def load(self, bound_instance: BoundInstance) -> Generator[ModelLoadingResponse]:
         (
@@ -80,9 +88,13 @@ class MlxBuilder(Builder):
                 self.tokenizer.tool_parser,  # type: ignore
             )
 
-        kv_prefix_cache = KVPrefixCache(self.group)
-
         device_rank = 0 if self.group is None else self.group.rank()
+        persistence = configured_astrid_persistence(
+            str(self.model_id),
+            device_rank,
+            self.shard_profile or "unconnected-single-device",
+        )
+        kv_prefix_cache = KVPrefixCache(self.group, persistence=persistence)
         if os.environ.get("EXO_NO_BATCH"):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(

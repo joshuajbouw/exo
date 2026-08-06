@@ -298,6 +298,8 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.close()
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
@@ -553,6 +555,8 @@ class BatchGenerator(Engine):
 
     def close(self) -> None:
         self._gen.close()
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.close()
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

@@ -11,12 +11,14 @@ from mlx_lm.sample_utils import make_sampler
 from exo.shared.types.common import ModelId
 from exo.shared.types.text_generation import InputMessage, TextGenerationTaskParams
 from exo.worker.engines.mlx.cache import (
+    CacheSnapshot,
     KVPrefixCache,
     cache_length,
     encode_prompt,
     get_prefix_length,
     make_kv_cache,
 )
+from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
 from exo.worker.engines.mlx.generator.generate import mlx_generate, prefill
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import apply_chat_template
@@ -104,6 +106,166 @@ class TestKVPrefix:
         cache = KVPrefixCache(None)
         cache.clear()
         assert len(cache.prompts) == 0
+
+    def test_add_schedules_durable_store(self, mock_tokenizer):
+        class RecordingPersistence:
+            def __init__(self):
+                self.stored: list[tuple[int, float]] = []
+
+            def restore_longest(
+                self,
+                prompt_tokens: mx.array,
+                minimum_tokens: int,
+                media_regions: list[object],
+            ) -> PersistedKVPrefix | None:
+                return None
+
+            def schedule_store(
+                self,
+                prompt_tokens: mx.array,
+                cache: list[KVCache],
+                snapshots: list[CacheSnapshot] | None,
+                media_regions: list[object],
+                prefill_tps: float,
+            ) -> None:
+                self.stored.append((len(prompt_tokens), prefill_tps))
+
+            def close(self) -> None:
+                pass
+
+        persistence = RecordingPersistence()
+        cache = KVPrefixCache(None, persistence=persistence)  # type: ignore[arg-type]
+        cache.add_kv_cache(
+            mx.array([1, 2, 3]),
+            [KVCache()],
+            prefill_tps=123.0,
+        )
+
+        assert persistence.stored == [(3, 123.0)]
+
+    def test_restore_populates_memory_without_republishing(self, mock_tokenizer):
+        class RestoringPersistence:
+            def __init__(self):
+                self.restore_calls = 0
+                self.store_calls = 0
+
+            def restore_longest(
+                self,
+                prompt_tokens: mx.array,
+                minimum_tokens: int,
+                media_regions: list[object],
+            ) -> PersistedKVPrefix | None:
+                self.restore_calls += 1
+                restored = KVCache()
+                restored.offset = 3
+                return PersistedKVPrefix(
+                    prompt_tokens=mx.array([1, 2, 3]),
+                    cache=[restored],
+                    snapshots=None,
+                    media_regions=[],
+                    prefill_tps=456.0,
+                )
+
+            def schedule_store(
+                self,
+                prompt_tokens: mx.array,
+                cache: list[KVCache],
+                snapshots: list[CacheSnapshot] | None,
+                media_regions: list[object],
+                prefill_tps: float,
+            ) -> None:
+                self.store_calls += 1
+
+            def close(self) -> None:
+                pass
+
+        persistence = RestoringPersistence()
+        cache = KVPrefixCache(None, persistence=persistence)  # type: ignore[arg-type]
+        _, remaining, matched_index, _ = cache.get_kv_cache(
+            object(),  # type: ignore[arg-type]
+            mx.array([1, 2, 3, 4]),
+        )
+
+        assert persistence.restore_calls == 1
+        assert persistence.store_calls == 0
+        assert matched_index == 0
+        assert len(remaining) == 1
+        assert len(cache.prompts) == 1
+
+    def test_restored_nontrimmable_cache_is_usable_at_complete_boundary(
+        self, mock_tokenizer
+    ):
+        class RestoringPersistence:
+            def restore_longest(
+                self,
+                prompt_tokens: mx.array,
+                minimum_tokens: int,
+                media_regions: list[object],
+            ) -> PersistedKVPrefix | None:
+                restored = KVCache()
+                restored.offset = 3
+                return PersistedKVPrefix(
+                    prompt_tokens=mx.array([1, 2, 3]),
+                    cache=[restored],
+                    snapshots=None,
+                    media_regions=[],
+                    prefill_tps=456.0,
+                )
+
+            def schedule_store(
+                self,
+                prompt_tokens: mx.array,
+                cache: list[KVCache],
+                snapshots: list[CacheSnapshot] | None,
+                media_regions: list[object],
+                prefill_tps: float,
+            ) -> None:
+                pass
+
+            def close(self) -> None:
+                pass
+
+        cache = KVPrefixCache(None, persistence=RestoringPersistence())  # type: ignore[arg-type]
+        with patch(
+            "exo.worker.engines.mlx.cache.has_non_kv_caches", return_value=True
+        ):
+            restored, remaining, matched_index, _ = cache.get_kv_cache(
+                object(),  # type: ignore[arg-type]
+                mx.array([1, 2, 3, 4]),
+            )
+
+        assert matched_index == 0
+        assert cache_length(restored) == 3
+        assert len(remaining) == 1
+
+    def test_persistence_failure_does_not_fail_cache_add(self, mock_tokenizer):
+        class FailingPersistence:
+            def restore_longest(
+                self,
+                prompt_tokens: mx.array,
+                minimum_tokens: int,
+                media_regions: list[object],
+            ) -> PersistedKVPrefix | None:
+                return None
+
+            def schedule_store(
+                self,
+                prompt_tokens: mx.array,
+                cache: list[KVCache],
+                snapshots: list[CacheSnapshot] | None,
+                media_regions: list[object],
+                prefill_tps: float,
+            ) -> None:
+                raise OSError("store unavailable")
+
+            def close(self) -> None:
+                pass
+
+        cache = KVPrefixCache(None, persistence=FailingPersistence())  # type: ignore[arg-type]
+        cache.add_kv_cache(mx.array([1, 2, 3]), [KVCache()])
+
+        assert len(cache.prompts) == 1
+        assert len(cache.caches) == 1
 
 
 def _load_gpt_oss() -> tuple[Model, object]:
