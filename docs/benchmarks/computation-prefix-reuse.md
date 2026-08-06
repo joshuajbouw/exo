@@ -13,22 +13,22 @@ capsule, MCP, CLI, or network hop in the measured path.
 
 Host: Apple M2 Ultra with 192 GB unified memory.
 Model: `mlx-community/gemma-4-31b-it-4bit`.
-Workload: 4,096 retained prefix tokens plus a 256-token continuation
+Workloads: 4,096 to 16,384 retained prefix tokens plus a continuation.
 
-| Path | Time to first token |
-|---|---:|
-| Cold 4,352-token input | 26.252 s |
-| Store restore | 2.994 s |
-| Compute 258-token suffix | 2.094 s |
-| Restored total | 5.088 s |
+| Prefix | New input | Cold TTFT | Store restore | Suffix compute | Restored TTFT | Speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4,096 | 256 | 26.212 s | 2.994 s | 2.094 s | 5.088 s | **5.16x** |
+| 8,192 | 512 | 53.051 s | 3.174 s | 3.416 s | 6.590 s | **8.05x** |
+| 16,384 | 512 | 105.001 s | 4.988 s | 3.591 s | 8.578 s | **12.24x** |
 
-The end-to-end restart speedup was **5.16x**. The first token matched the cold
-control. Publishing the checkpoint took 4.936 seconds on the background path;
-ordinary generation does not wait for that work.
+Every restored run produced the same first token as its cold control. The
+checkpoint publication costs were 5.023, 7.199, and 9.579 seconds respectively
+on the background path; ordinary generation does not wait for that work.
 
-A 128-prefix/32-continuation control measured 1.38x after storage reopen. This
-small case is useful because it exposes the fixed retrieval cost: reuse becomes
-more valuable as avoided prefill grows.
+A 128-prefix/32-continuation control varied around break-even because verified
+store startup and retrieval dominate the tiny amount of avoided computation.
+The matrix shows the expected scaling: reuse becomes more valuable as avoided
+prefill grows while restore cost rises much more slowly.
 
 Run the benchmark with:
 
