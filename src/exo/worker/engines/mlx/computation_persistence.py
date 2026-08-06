@@ -1,4 +1,4 @@
-"""Optional Astrid-backed persistence for Exo's MLX prefix cache."""
+"""Optional durable persistence for Exo's MLX prefix cache."""
 
 from __future__ import annotations
 
@@ -40,8 +40,8 @@ class _CheckpointMetadata(msgspec.Struct, frozen=True):
     prefill_tps: float
 
 
-class AstridKVPrefixPersistence:
-    """Persist verified MLX prompt-cache files in Astrid.
+class StoreKVPrefixPersistence:
+    """Persist verified MLX prompt-cache files in a computation store.
 
     ``runtime_profile`` must change whenever model weights, tokenizer/template,
     cache layout, numerical behavior, shard assignment, or backend semantics
@@ -51,16 +51,16 @@ class AstridKVPrefixPersistence:
 
     def __init__(self, store_path: Path, runtime_profile: str):
         try:
-            from exo_astrid_store import AstridStore
+            from exo_computation_store import ComputationStore
         except ImportError as error:
             raise RuntimeError(
-                "EXO_ASTRID_STORE requires the optional "
-                "integrations/astrid_store extension"
+                "EXO_COMPUTATION_STORE requires the optional "
+                "integrations/computation_store extension"
             ) from error
 
         if not runtime_profile:
-            raise ValueError("Astrid KV persistence requires a runtime profile")
-        self._store = AstridStore(store_path)
+            raise ValueError("computation persistence requires a runtime profile")
+        self._store = ComputationStore(store_path)
         self._runtime_profile = runtime_profile
         self._profile_id = _digest(runtime_profile.encode())
         self._index_lock = Lock()
@@ -68,12 +68,12 @@ class AstridKVPrefixPersistence:
         self._pending: _PendingCheckpoint | None = None
         self._closing = False
         self._temporary_directory = tempfile.TemporaryDirectory(
-            prefix="exo-astrid-kv-"
+            prefix="exo-computation-kv-"
         )
         self._temporary = Path(self._temporary_directory.name)
         self._worker = Thread(
             target=self._publication_loop,
-            name="exo-astrid-kv",
+            name="exo-computation-kv",
             daemon=True,
         )
         self._worker.start()
@@ -106,7 +106,7 @@ class AstridKVPrefixPersistence:
                     continue
                 try:
                     if content_object != metadata.content_object:
-                        raise ValueError("Astrid checkpoint object identity mismatch")
+                        raise ValueError("checkpoint object identity mismatch")
                     restored = cast(
                         KVCacheType,
                         cast(object, load_prompt_cache(str(destination))),
@@ -115,7 +115,7 @@ class AstridKVPrefixPersistence:
                     destination.unlink(missing_ok=True)
                 if cache_length(restored) != metadata.cache_tokens:
                     logger.warning(
-                        "Astrid KV checkpoint length mismatch; treating it as a miss"
+                        "KV checkpoint length mismatch; treating it as a miss"
                     )
                     continue
                 return PersistedKVPrefix(
@@ -127,7 +127,7 @@ class AstridKVPrefixPersistence:
                 )
         except Exception:
             logger.opt(exception=True).warning(
-                "Astrid KV restore failed; continuing with uncached inference"
+                "KV checkpoint restore failed; continuing with uncached inference"
             )
         return None
 
@@ -174,7 +174,7 @@ class AstridKVPrefixPersistence:
                 self._store_checkpoint(prompt_tokens, cache, prefill_tps)
             except Exception:
                 logger.opt(exception=True).warning(
-                    "Astrid KV publication failed; inference result remains valid"
+                    "KV checkpoint publication failed; inference result remains valid"
                 )
 
     def _store_checkpoint(
@@ -230,7 +230,7 @@ class AstridKVPrefixPersistence:
             return []
         decoded = msgspec.json.decode(bytes(encoded), type=list[int])
         if not all(value >= 0 for value in decoded):
-            raise ValueError("invalid Astrid prefix index")
+            raise ValueError("invalid prefix index")
         return sorted(set(decoded))
 
     def _read_metadata(self, prefix_id: str) -> _CheckpointMetadata | None:
@@ -243,23 +243,24 @@ class AstridKVPrefixPersistence:
             or decoded.runtime_profile != self._profile_id
             or decoded.prefix_id != prefix_id
         ):
-            raise ValueError("Astrid prefix metadata identity mismatch")
+            raise ValueError("prefix metadata identity mismatch")
         return decoded
 
-def configured_astrid_persistence(
+def configured_computation_persistence(
     model_id: str,
     device_rank: int,
     shard_profile: str,
-) -> AstridKVPrefixPersistence | None:
+) -> StoreKVPrefixPersistence | None:
     """Create the opt-in backend or leave ordinary Exo behavior unchanged."""
 
-    path = os.environ.get("EXO_ASTRID_STORE")
+    path = os.environ.get("EXO_COMPUTATION_STORE")
     if path is None:
         return None
-    profile = os.environ.get("EXO_ASTRID_RUNTIME_PROFILE")
+    profile = os.environ.get("EXO_COMPUTATION_RUNTIME_PROFILE")
     if not profile:
         logger.warning(
-            "EXO_ASTRID_STORE ignored: set EXO_ASTRID_RUNTIME_PROFILE to an "
+            "EXO_COMPUTATION_STORE ignored: set "
+            "EXO_COMPUTATION_RUNTIME_PROFILE to an "
             "identity for the exact model/tokenizer/MLX/shard semantics"
         )
         return None
@@ -271,10 +272,10 @@ def configured_astrid_persistence(
     )
     profile_store = Path(path) / _digest(scoped_profile.encode())
     try:
-        return AstridKVPrefixPersistence(profile_store, scoped_profile)
+        return StoreKVPrefixPersistence(profile_store, scoped_profile)
     except Exception:
         logger.opt(exception=True).warning(
-            "Astrid KV persistence unavailable; continuing without it"
+            "computation persistence unavailable; continuing without it"
         )
         return None
 

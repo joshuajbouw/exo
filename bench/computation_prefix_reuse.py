@@ -1,6 +1,6 @@
 # type: ignore
 #!/usr/bin/env python3
-"""Measure durable MLX prefix reuse through Astrid's embedded store."""
+"""Measure durable MLX prefix reuse through the computation-store seam."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from mlx_lm import load
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_sampler
 
-from exo.worker.engines.mlx.astrid_persistence import AstridKVPrefixPersistence
 from exo.worker.engines.mlx.cache import KVPrefixCache, make_kv_cache
+from exo.worker.engines.mlx.computation_persistence import StoreKVPrefixPersistence
 from exo.worker.engines.mlx.generator.generate import prefill
 
 
@@ -64,7 +64,7 @@ def main() -> None:
     prefix = _tokens(
         tokenizer,
         args.prefix_tokens,
-        "Astrid and Exo conserve deterministic computation across a local fleet. ",
+        "A compute fleet can conserve deterministic work across local processes. ",
     )
     suffix = _tokens(
         tokenizer,
@@ -73,8 +73,8 @@ def main() -> None:
     )
     continued = mx.concatenate([prefix, suffix])
 
-    with tempfile.TemporaryDirectory(prefix="exo-astrid-bench-") as store:
-        persistence = AstridKVPrefixPersistence(Path(store), args.runtime_profile)
+    with tempfile.TemporaryDirectory(prefix="exo-computation-bench-") as store:
+        persistence = StoreKVPrefixPersistence(Path(store), args.runtime_profile)
         prefix_cache = KVPrefixCache(None, persistence=persistence)
         computed = make_kv_cache(model)
         prefix_started = time.perf_counter()
@@ -103,7 +103,7 @@ def main() -> None:
         gc.collect()
         mx.clear_cache()
 
-        reopened = AstridKVPrefixPersistence(Path(store), args.runtime_profile)
+        reopened = StoreKVPrefixPersistence(Path(store), args.runtime_profile)
         restarted_cache = KVPrefixCache(None, persistence=reopened)
         restore_started = time.perf_counter()
         restored, remaining, matched_index, _ = restarted_cache.get_kv_cache(

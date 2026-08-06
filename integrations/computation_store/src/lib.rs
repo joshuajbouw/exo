@@ -16,13 +16,13 @@ const KV_NAMESPACE: &str = "system:exo-computation-reuse";
 const READ_SIZE: u64 = 8 * 1024 * 1024;
 
 #[pyclass]
-struct AstridStore {
+struct ComputationStore {
     runtime: Runtime,
     store: RuntimePrincipalStore,
 }
 
 #[pymethods]
-impl AstridStore {
+impl ComputationStore {
     #[new]
     fn new(path: PathBuf) -> PyResult<Self> {
         let runtime = Builder::new_multi_thread()
@@ -153,6 +153,6 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
 }
 
 #[pymodule]
-fn exo_astrid_store(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<AstridStore>()
+fn exo_computation_store(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<ComputationStore>()
 }

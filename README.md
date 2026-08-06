@@ -315,8 +315,8 @@ exo supports several environment variables for configuration:
 | `EXO_LIBP2P_NAMESPACE` | Custom namespace for cluster isolation | None |
 | `EXO_FAST_SYNCH` | Control MLX_METAL_FAST_SYNCH behavior (for JACCL backend) | Auto |
 | `EXO_TRACING_ENABLED` | Enable distributed tracing for performance analysis | `false` |
-| `EXO_ASTRID_STORE` | Opt in to durable MLX prefix-cache reuse through the optional Astrid adapter. | None |
-| `EXO_ASTRID_RUNTIME_PROFILE` | Exact semantic identity of the model closure, tokenizer/template, MLX runtime, cache schema, and shard plan. Required with `EXO_ASTRID_STORE`. | None |
+| `EXO_COMPUTATION_STORE` | Opt in to durable MLX prefix-cache reuse through the optional computation-store adapter. | None |
+| `EXO_COMPUTATION_RUNTIME_PROFILE` | Exact semantic identity of the model closure, tokenizer/template, MLX runtime, cache schema, and shard plan. Required with `EXO_COMPUTATION_STORE`. | None |
 
 **Example usage:**
 
@@ -337,20 +337,20 @@ EXO_ENABLE_IMAGE_MODELS=true uv run exo
 EXO_LIBP2P_NAMESPACE=my-dev-cluster uv run exo
 ```
 
-### Durable MLX prefix reuse with Astrid
+### Durable MLX prefix reuse
 
-The optional Astrid adapter can retain completed MLX prefix computations across
-process restarts. A matching continuation restores the longest compatible
-checkpoint and prefills only the remaining suffix. Persistence is an
-accelerator: missing, corrupt, or unavailable storage falls back to ordinary
-inference and never invalidates a generated result.
+The optional computation-store adapter can retain completed MLX prefix
+computations across process restarts. A matching continuation restores the
+longest compatible checkpoint and prefills only the remaining suffix.
+Persistence is an accelerator: missing, corrupt, or unavailable storage falls
+back to ordinary inference and never invalidates a generated result.
 
 Install the adapter and opt in explicitly:
 
 ```bash
-uv pip install ./integrations/astrid_store
-EXO_ASTRID_STORE="$HOME/.local/share/exo/astrid" \
-EXO_ASTRID_RUNTIME_PROFILE="gemma-model-closure-and-runtime-v1" \
+uv pip install ./integrations/computation_store
+EXO_COMPUTATION_STORE="$HOME/.local/share/exo/computation" \
+EXO_COMPUTATION_RUNTIME_PROFILE="gemma-model-closure-and-runtime-v1" \
 uv run exo
 ```
 
@@ -361,8 +361,8 @@ Exo currently persists ordinary text KV caches only; vision inputs and models
 with media inputs remain on the normal uncached path. Complete SSM and rotating
 cache states may be restored at their exact checkpoint boundary; Exo still
 requires a live rollback snapshot before trimming inside such a checkpoint.
-See the [measured Gemma 4 benchmark](docs/benchmarks/astrid-prefix-reuse.md) for
-the end-to-end restart result and its claim boundaries.
+See the [measured Gemma 4 benchmark](docs/benchmarks/computation-prefix-reuse.md)
+for the end-to-end restart result and its claim boundaries.
 
 ---
 

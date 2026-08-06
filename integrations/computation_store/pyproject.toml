@@ -3,10 +3,10 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "exo-astrid-store"
+name = "exo-computation-store"
 version = "0.1.0"
-description = "Optional Astrid storage backend for Exo computation reuse"
+description = "Optional durable store backend for Exo computation reuse"
 requires-python = ">=3.13"
 
 [tool.maturin]
-module-name = "exo_astrid_store"
+module-name = "exo_computation_store"

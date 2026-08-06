@@ -20,8 +20,8 @@ from exo.worker.runner.llm_inference.batch_generator import (
 )
 from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
-from .astrid_persistence import configured_astrid_persistence
 from .cache import KVPrefixCache
+from .computation_persistence import configured_computation_persistence
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -89,7 +89,7 @@ class MlxBuilder(Builder):
             )
 
         device_rank = 0 if self.group is None else self.group.rank()
-        persistence = configured_astrid_persistence(
+        persistence = configured_computation_persistence(
             str(self.model_id),
             device_rank,
             self.shard_profile or "unconnected-single-device",

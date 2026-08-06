@@ -1,11 +1,11 @@
 [package]
-name = "exo-astrid-store"
+name = "exo-computation-store"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [lib]
-name = "exo_astrid_store"
+name = "exo_computation_store"
 crate-type = ["cdylib"]
 
 [dependencies]

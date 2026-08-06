@@ -8,15 +8,15 @@ from threading import Event
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache
 
-from exo.worker.engines.mlx.astrid_persistence import (
-    AstridKVPrefixPersistence,
+from exo.worker.engines.mlx.cache import cache_length
+from exo.worker.engines.mlx.computation_persistence import (
+    StoreKVPrefixPersistence,
     _prefix_id,
     _scoped_runtime_profile,
 )
-from exo.worker.engines.mlx.cache import cache_length
 
 
-class _FakeAstridStore:
+class _FakeComputationStore:
     files: dict[tuple[str, str], bytes] = {}
     values: dict[tuple[str, str], bytes] = {}
     fail_put = False
@@ -52,8 +52,8 @@ class _FakeAstridStore:
 
 
 def _install_fake_store() -> None:
-    module = types.ModuleType("exo_astrid_store")
-    module.AstridStore = _FakeAstridStore
+    module = types.ModuleType("exo_computation_store")
+    module.ComputationStore = _FakeComputationStore
     sys.modules[module.__name__] = module
 
 
@@ -89,12 +89,12 @@ def test_runtime_profile_binds_model_rank_and_implementation_versions():
 
 def test_checkpoint_round_trips_through_storage(tmp_path: Path):
     _install_fake_store()
-    _FakeAstridStore.files.clear()
-    _FakeAstridStore.values.clear()
-    _FakeAstridStore.fail_put = False
-    _FakeAstridStore.put_started = None
-    _FakeAstridStore.release_put = None
-    persistence = AstridKVPrefixPersistence(tmp_path / "store", "profile-a")
+    _FakeComputationStore.files.clear()
+    _FakeComputationStore.values.clear()
+    _FakeComputationStore.fail_put = False
+    _FakeComputationStore.put_started = None
+    _FakeComputationStore.release_put = None
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
     prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
     cache = KVCache()
     keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
@@ -114,12 +114,12 @@ def test_checkpoint_round_trips_through_storage(tmp_path: Path):
 
 def test_corrupt_metadata_is_a_cache_miss(tmp_path: Path):
     _install_fake_store()
-    _FakeAstridStore.files.clear()
-    _FakeAstridStore.values.clear()
-    _FakeAstridStore.fail_put = False
-    _FakeAstridStore.put_started = None
-    _FakeAstridStore.release_put = None
-    persistence = AstridKVPrefixPersistence(tmp_path / "store", "profile-a")
+    _FakeComputationStore.files.clear()
+    _FakeComputationStore.values.clear()
+    _FakeComputationStore.fail_put = False
+    _FakeComputationStore.put_started = None
+    _FakeComputationStore.release_put = None
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
     prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
     cache = KVCache()
     keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
@@ -128,9 +128,9 @@ def test_corrupt_metadata_is_a_cache_miss(tmp_path: Path):
     persistence._store_checkpoint(prompt, [cache], 1.0)
 
     metadata_key = next(
-        key for path, key in _FakeAstridStore.values if key.startswith("prefix/v1/")
+        key for path, key in _FakeComputationStore.values if key.startswith("prefix/v1/")
     )
-    _FakeAstridStore.values[(str(tmp_path / "store"), metadata_key)] = b"not-json"
+    _FakeComputationStore.values[(str(tmp_path / "store"), metadata_key)] = b"not-json"
 
     assert persistence.restore_longest(prompt, 0, []) is None
     persistence.close()
@@ -138,12 +138,12 @@ def test_corrupt_metadata_is_a_cache_miss(tmp_path: Path):
 
 def test_background_publication_failure_does_not_escape_close(tmp_path: Path):
     _install_fake_store()
-    _FakeAstridStore.files.clear()
-    _FakeAstridStore.values.clear()
-    _FakeAstridStore.fail_put = True
-    _FakeAstridStore.put_started = None
-    _FakeAstridStore.release_put = None
-    persistence = AstridKVPrefixPersistence(tmp_path / "store", "profile-a")
+    _FakeComputationStore.files.clear()
+    _FakeComputationStore.values.clear()
+    _FakeComputationStore.fail_put = True
+    _FakeComputationStore.put_started = None
+    _FakeComputationStore.release_put = None
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
     prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
     cache = KVCache()
     keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
@@ -153,31 +153,31 @@ def test_background_publication_failure_does_not_escape_close(tmp_path: Path):
     persistence.schedule_store(prompt, [cache], None, [], 1.0)
     persistence.close()
 
-    _FakeAstridStore.fail_put = False
+    _FakeComputationStore.fail_put = False
 
 
 def test_pending_publication_coalesces_to_latest_frontier(tmp_path: Path):
     _install_fake_store()
-    _FakeAstridStore.files.clear()
-    _FakeAstridStore.values.clear()
-    _FakeAstridStore.fail_put = False
-    _FakeAstridStore.put_started = Event()
-    _FakeAstridStore.release_put = Event()
-    persistence = AstridKVPrefixPersistence(tmp_path / "store", "profile-a")
+    _FakeComputationStore.files.clear()
+    _FakeComputationStore.values.clear()
+    _FakeComputationStore.fail_put = False
+    _FakeComputationStore.put_started = Event()
+    _FakeComputationStore.release_put = Event()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
     cache = KVCache()
     keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
     cache.update_and_fetch(keys, keys)
     mx.eval(cache.state)
 
     persistence.schedule_store(mx.array([1, 2, 3, 4]), [cache], None, [], 1.0)
-    assert _FakeAstridStore.put_started.wait(timeout=5)
+    assert _FakeComputationStore.put_started.wait(timeout=5)
     persistence.schedule_store(mx.array([1, 2, 3, 4, 5]), [cache], None, [], 1.0)
     persistence.schedule_store(
         mx.array([1, 2, 3, 4, 5, 6]), [cache], None, [], 1.0
     )
-    _FakeAstridStore.release_put.set()
+    _FakeComputationStore.release_put.set()
     persistence.close()
 
     assert persistence._read_lengths() == [4, 6]
-    _FakeAstridStore.put_started = None
-    _FakeAstridStore.release_put = None
+    _FakeComputationStore.put_started = None
+    _FakeComputationStore.release_put = None

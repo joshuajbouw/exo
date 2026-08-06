@@ -1,12 +1,13 @@
-# Astrid-backed MLX prefix reuse
+# Durable MLX prefix reuse
 
 This benchmark measures Exo restoring a completed MLX prefix computation from
-Astrid's embedded verified content store after the in-memory prefix cache has
-been destroyed.
+the embedded computation store after the in-memory prefix cache has been
+destroyed.
 
-It runs directly through `AstridKVPrefixPersistence` and the optional PyO3
-adapter. There is no daemon, capsule, MCP, CLI, or network hop in the measured
-path.
+It runs directly through `StoreKVPrefixPersistence` and the optional PyO3
+adapter. The current adapter uses Astrid's verified content engine internally,
+but that provider is outside Exo's persistence contract. There is no daemon,
+capsule, MCP, CLI, or network hop in the measured path.
 
 ## Result
 
@@ -17,7 +18,7 @@ Workload: 4,096 retained prefix tokens plus a 256-token continuation
 | Path | Time to first token |
 |---|---:|
 | Cold 4,352-token input | 26.252 s |
-| Astrid restore | 2.994 s |
+| Store restore | 2.994 s |
 | Compute 258-token suffix | 2.094 s |
 | Restored total | 5.088 s |
 
@@ -32,8 +33,8 @@ more valuable as avoided prefill grows.
 Run the benchmark with:
 
 ```bash
-uv pip install ./integrations/astrid_store
-uv run bench/astrid_prefix_reuse.py /path/to/mlx-model \
+uv pip install ./integrations/computation_store
+uv run bench/computation_prefix_reuse.py /path/to/mlx-model \
   --prefix-tokens 4096 \
   --append-tokens 256 \
   --runtime-profile exact-model-closure-id
@@ -44,11 +45,11 @@ uv run bench/astrid_prefix_reuse.py /path/to/mlx-model \
 The result demonstrates durable partial computation reuse. It does not make
 novel autoregressive decoding faster, and it does not yet memoize complete
 generation results. The current physical representation is an MLX safetensors
-checkpoint. Astrid converges identical and overlapping bytes, but tensor-aware
-block or delta representations are needed to minimize incremental storage for
-long growing sessions.
+checkpoint. The current backend converges identical and overlapping bytes, but
+tensor-aware block or delta representations are needed to minimize incremental
+storage for long growing sessions.
 
 Checkpoint retention and physical reclamation remain operator policy. A
-production fleet must route those through Astrid's computation-sharing domain,
-resource accounting, and compaction scheduler rather than growing an
-unbounded private cache.
+production fleet must route those through its computation-sharing domain,
+resource accounting, and compaction scheduler rather than growing an unbounded
+private cache.
