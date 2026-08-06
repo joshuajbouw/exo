@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 astrid-core = { git = "https://github.com/astrid-runtime/astrid.git", rev = "433dde1d437f7f05614a83d5d0fbf1122b2131c6" }
 astrid-storage = { git = "https://github.com/astrid-runtime/astrid.git", rev = "433dde1d437f7f05614a83d5d0fbf1122b2131c6" }
+blake3 = { version = "1.8", features = ["mmap", "rayon"] }
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 tokio = { version = "1.46", features = ["rt-multi-thread"] }
 

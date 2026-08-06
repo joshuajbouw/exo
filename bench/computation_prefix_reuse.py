@@ -28,14 +28,19 @@ def _tokens(tokenizer: Any, target: int, text: str) -> mx.array:
     return mx.array((seed * repetitions)[:target])
 
 
-def _first_token(model: Any, tokens: mx.array, prompt_cache: list[Any]) -> tuple[int, float]:
+def _first_token(
+    model: Any,
+    tokens: mx.array,
+    prompt_cache: list[Any],
+    prefill_step_size: int,
+) -> tuple[int, float]:
     started = time.perf_counter()
     iterator = generate_step(
         tokens,
         model,
         max_tokens=1,
         prompt_cache=prompt_cache,
-        prefill_step_size=4096,
+        prefill_step_size=prefill_step_size,
     )
     token, logprobs = next(iterator)
     mx.eval(logprobs)
@@ -99,6 +104,7 @@ def main() -> None:
         )
         prefix_cache.close()
         publish_seconds = time.perf_counter() - publish_started
+        publication_metrics = persistence.last_publication_metrics
         del prefix_cache, computed, persistence
         gc.collect()
         mx.clear_cache()
@@ -110,21 +116,36 @@ def main() -> None:
             model, continued
         )
         restore_seconds = time.perf_counter() - restore_started
-        restored_token, suffix_seconds = _first_token(model, remaining, restored)
+        restore_metrics = reopened.last_restore_metrics
+        restored_token, suffix_seconds = _first_token(model, remaining, restored, 512)
         restarted_cache.close()
 
         cold = make_kv_cache(model)
-        cold_token, cold_seconds = _first_token(model, continued, cold)
+        cold_token, cold_seconds = _first_token(model, continued, cold, 4096)
 
         warm_seconds = restore_seconds + suffix_seconds
         result = {
             "model": str(args.model),
             "prefix_tokens": len(prefix),
             "append_tokens": len(suffix),
+            "restored_prefill_step_size": 512,
+            "cold_prefill_step_size": 4096,
             "prefix_prefill_seconds": prefix_seconds,
             "checkpoint_publish_seconds": publish_seconds,
+            "mlx_serialization_seconds": (
+                publication_metrics.mlx_serialization_seconds
+            ),
+            "store_admission_seconds": publication_metrics.store_admission_seconds,
+            "metadata_publication_seconds": (
+                publication_metrics.metadata_publication_seconds
+            ),
             "cold_seconds_to_first_token": cold_seconds,
             "restore_seconds": restore_seconds,
+            "projection_verification_seconds": (
+                restore_metrics.projection_verification_seconds
+            ),
+            "store_reconstruction_seconds": restore_metrics.reconstruction_seconds,
+            "mlx_load_seconds": restore_metrics.mlx_load_seconds,
             "suffix_compute_seconds": suffix_seconds,
             "restored_seconds_to_first_token": warm_seconds,
             "speedup": cold_seconds / warm_seconds,

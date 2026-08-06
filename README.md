@@ -362,7 +362,10 @@ with media inputs remain on the normal uncached path. Complete SSM and rotating
 cache states may be restored at their exact checkpoint boundary; Exo still
 requires a live rollback snapshot before trimming inside such a checkpoint.
 See the [measured Gemma 4 benchmark](docs/benchmarks/computation-prefix-reuse.md)
-for the end-to-end restart result and its claim boundaries.
+for the end-to-end restart result and its claim boundaries. On an M2 Ultra, a
+16,384-token checkpoint reopened and verified in 0.141 seconds; adding 512 new
+tokens reached first output in 3.606 seconds versus 105.805 seconds cold, a
+29.34x end-to-end speedup with the same first token.
 
 ---
 

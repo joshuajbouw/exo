@@ -32,3 +32,10 @@ Publication happens after inference on a background worker. A crash can leave
 unreferenced content or incomplete metadata, but lookup advertises only a
 complete checkpoint. Storage failure is always a cache miss, never inference
 failure.
+
+The adapter also maintains an evictable contiguous projection beside the
+authoritative store. Admission computes an algorithm-tagged representation
+digest during the existing input pass. A later process hashes the projection
+against that digest before MLX opens it; a missing or modified projection is
+reconstructed from verified content. Projection corruption can therefore lose
+warmth, never computation correctness.

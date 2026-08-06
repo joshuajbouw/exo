@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use tokio::runtime::{Builder, Runtime};
 
 const KV_NAMESPACE: &str = "system:exo-computation-reuse";
 const READ_SIZE: u64 = 8 * 1024 * 1024;
+const HASH_BUFFER_SIZE: usize = 32 * 1024 * 1024;
 
 #[pyclass]
 struct ComputationStore {
@@ -50,16 +51,20 @@ impl ComputationStore {
         })
     }
 
-    fn put_file(&self, py: Python<'_>, name: &str, source: PathBuf) -> PyResult<String> {
+    fn put_file(&self, py: Python<'_>, name: &str, source: PathBuf) -> PyResult<(String, String)> {
         let name = content_name(name)?;
         py.detach(|| {
             let file = File::open(source).map_err(io_error)?;
+            let mut reader = HashingReader::new(BufReader::with_capacity(HASH_BUFFER_SIZE, file));
             let content = self.store.content();
             let outcome = content
-                .put_streaming(&StateOwner::System, &name, file)
+                .put_streaming(&StateOwner::System, &name, &mut reader)
                 .map_err(runtime_error)?;
             content.flush().map_err(runtime_error)?;
-            Ok(object_id_hex(outcome.descriptor().file().as_bytes()))
+            Ok((
+                object_id_hex(outcome.descriptor().file().as_bytes()),
+                reader.digest(),
+            ))
         })
     }
 
@@ -68,7 +73,7 @@ impl ComputationStore {
         py: Python<'_>,
         name: &str,
         destination: PathBuf,
-    ) -> PyResult<Option<String>> {
+    ) -> PyResult<Option<(String, String)>> {
         let name = content_name(name)?;
         py.detach(|| {
             let content = self.store.content();
@@ -80,17 +85,26 @@ impl ComputationStore {
             };
             let object_id = object_id_hex(handle.descriptor().file().as_bytes());
             let mut output = BufWriter::new(File::create(destination).map_err(io_error)?);
+            let mut hasher = blake3::Hasher::new();
             let logical_bytes = handle.descriptor().logical_bytes();
             let mut offset = 0_u64;
             while offset < logical_bytes {
                 let length = READ_SIZE.min(logical_bytes - offset);
-                output
-                    .write_all(&handle.read_range(offset, length).map_err(runtime_error)?)
-                    .map_err(io_error)?;
+                let bytes = handle.read_range(offset, length).map_err(runtime_error)?;
+                hasher.update_rayon(&bytes);
+                output.write_all(&bytes).map_err(io_error)?;
                 offset += length;
             }
             output.flush().map_err(io_error)?;
-            Ok(Some(object_id))
+            Ok(Some((object_id, tagged_blake3(hasher.finalize()))))
+        })
+    }
+
+    fn digest_file(&self, py: Python<'_>, source: PathBuf) -> PyResult<String> {
+        py.detach(|| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update_mmap_rayon(source).map_err(io_error)?;
+            Ok(tagged_blake3(hasher.finalize()))
         })
     }
 
@@ -128,6 +142,38 @@ impl ComputationStore {
                 .block_on(self.store.kv().delete(KV_NAMESPACE, key))
                 .map_err(runtime_error)
         })
+    }
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn digest(&self) -> String {
+        tagged_blake3(self.hasher.finalize())
+    }
+}
+
+fn tagged_blake3(digest: blake3::Hash) -> String {
+    format!("blake3:{digest}")
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        // The content builder requests relatively small slices. Spawning Rayon
+        // work for each callback costs more than hashing these slices inline.
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
     }
 }
 

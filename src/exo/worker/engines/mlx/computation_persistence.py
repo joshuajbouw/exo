@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import time
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from threading import Condition, Lock, Thread
@@ -25,7 +27,7 @@ if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import MediaRegion
 
 
-_SCHEMA = 1
+_SCHEMA = 2
 _PREFIX_DOMAIN = b"exo-mlx-prefix-state-v1\0"
 type _PendingCheckpoint = tuple[mx.array, KVCacheType, float]
 
@@ -35,9 +37,24 @@ class _CheckpointMetadata(msgspec.Struct, frozen=True):
     runtime_profile: str
     prefix_id: str
     content_object: str
+    projection_digest: str
     token_count: int
     cache_tokens: int
     prefill_tps: float
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreMetrics:
+    projection_verification_seconds: float = 0.0
+    reconstruction_seconds: float = 0.0
+    mlx_load_seconds: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationMetrics:
+    mlx_serialization_seconds: float = 0.0
+    store_admission_seconds: float = 0.0
+    metadata_publication_seconds: float = 0.0
 
 
 class StoreKVPrefixPersistence:
@@ -67,10 +84,10 @@ class StoreKVPrefixPersistence:
         self._publication = Condition()
         self._pending: _PendingCheckpoint | None = None
         self._closing = False
-        self._temporary_directory = tempfile.TemporaryDirectory(
-            prefix="exo-computation-kv-"
-        )
-        self._temporary = Path(self._temporary_directory.name)
+        self._projections = store_path / "projections"
+        self._projections.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.last_restore_metrics = RestoreMetrics()
+        self.last_publication_metrics = PublicationMetrics()
         self._worker = Thread(
             target=self._publication_loop,
             name="exo-computation-kv",
@@ -84,6 +101,7 @@ class StoreKVPrefixPersistence:
         minimum_tokens: int,
         media_regions: list["MediaRegion"],
     ) -> PersistedKVPrefix | None:
+        self.last_restore_metrics = RestoreMetrics()
         if media_regions:
             return None
         try:
@@ -98,21 +116,46 @@ class StoreKVPrefixPersistence:
                 metadata = self._read_metadata(prefix_id)
                 if metadata is None or metadata.token_count != token_count:
                     continue
-                destination = self._temporary / f"restore-{prefix_id}.safetensors"
-                content_object = self._store.get_file(
-                    _content_name(self._profile_id, prefix_id), destination
+                projection = self._projection_path(metadata.content_object)
+                verification_seconds = 0.0
+                reconstruction_seconds = 0.0
+                if self._projection_available(projection):
+                    started = time.perf_counter()
+                    projection_digest = self._store.digest_file(projection)
+                    verification_seconds = time.perf_counter() - started
+                    if projection_digest != metadata.projection_digest:
+                        projection.unlink(missing_ok=True)
+                if not self._projection_available(projection):
+                    destination = self._temporary_path("restore", prefix_id)
+                    started = time.perf_counter()
+                    try:
+                        restored_identity = self._store.get_file(
+                            _content_name(self._profile_id, prefix_id), destination
+                        )
+                        if restored_identity is None:
+                            continue
+                        content_object, projection_digest = restored_identity
+                        if content_object != metadata.content_object:
+                            raise ValueError("checkpoint object identity mismatch")
+                        if projection_digest != metadata.projection_digest:
+                            raise ValueError(
+                                "checkpoint representation digest mismatch"
+                            )
+                        os.replace(destination, projection)
+                    finally:
+                        destination.unlink(missing_ok=True)
+                    reconstruction_seconds = time.perf_counter() - started
+                started = time.perf_counter()
+                restored = cast(
+                    KVCacheType,
+                    cast(object, load_prompt_cache(str(projection))),
                 )
-                if content_object is None:
-                    continue
-                try:
-                    if content_object != metadata.content_object:
-                        raise ValueError("checkpoint object identity mismatch")
-                    restored = cast(
-                        KVCacheType,
-                        cast(object, load_prompt_cache(str(destination))),
-                    )
-                finally:
-                    destination.unlink(missing_ok=True)
+                load_seconds = time.perf_counter() - started
+                self.last_restore_metrics = RestoreMetrics(
+                    projection_verification_seconds=verification_seconds,
+                    reconstruction_seconds=reconstruction_seconds,
+                    mlx_load_seconds=load_seconds,
+                )
                 if cache_length(restored) != metadata.cache_tokens:
                     logger.warning(
                         "KV checkpoint length mismatch; treating it as a miss"
@@ -159,7 +202,6 @@ class StoreKVPrefixPersistence:
             self._closing = True
             self._publication.notify()
         self._worker.join()
-        self._temporary_directory.cleanup()
 
     def _publication_loop(self) -> None:
         while True:
@@ -185,7 +227,8 @@ class StoreKVPrefixPersistence:
     ) -> None:
         token_count = len(prompt_tokens)
         prefix_id = _prefix_id(self._runtime_profile, prompt_tokens)
-        source = self._temporary / f"publish-{prefix_id}.safetensors"
+        source = self._temporary_path("publish", prefix_id)
+        started = time.perf_counter()
         save_prompt_cache(
             str(source),
             list(cache),  # pyright: ignore[reportArgumentType]
@@ -195,17 +238,23 @@ class StoreKVPrefixPersistence:
                 "prefix_id": prefix_id,
             },
         )
+        serialization_seconds = time.perf_counter() - started
+        started = time.perf_counter()
         try:
-            content_object = self._store.put_file(
+            content_object, projection_digest = self._store.put_file(
                 _content_name(self._profile_id, prefix_id), source
             )
+            os.replace(source, self._projection_path(content_object))
         finally:
             source.unlink(missing_ok=True)
+        admission_seconds = time.perf_counter() - started
+        started = time.perf_counter()
         metadata = _CheckpointMetadata(
             schema=_SCHEMA,
             runtime_profile=self._profile_id,
             prefix_id=prefix_id,
             content_object=content_object,
+            projection_digest=projection_digest,
             token_count=token_count,
             cache_tokens=cache_length(cache),
             prefill_tps=prefill_tps,
@@ -223,6 +272,11 @@ class StoreKVPrefixPersistence:
                     _index_key(self._profile_id),
                     msgspec.json.encode(lengths),
                 )
+        self.last_publication_metrics = PublicationMetrics(
+            mlx_serialization_seconds=serialization_seconds,
+            store_admission_seconds=admission_seconds,
+            metadata_publication_seconds=time.perf_counter() - started,
+        )
 
     def _read_lengths(self) -> list[int]:
         encoded = self._store.get(_index_key(self._profile_id))
@@ -242,9 +296,33 @@ class StoreKVPrefixPersistence:
             decoded.schema != _SCHEMA
             or decoded.runtime_profile != self._profile_id
             or decoded.prefix_id != prefix_id
+            or not _is_lower_hex(decoded.content_object, 64)
+            or not _is_representation_digest(decoded.projection_digest)
         ):
             raise ValueError("prefix metadata identity mismatch")
         return decoded
+
+    def _projection_path(self, content_object: str) -> Path:
+        if not _is_lower_hex(content_object, 64):
+            raise ValueError("invalid checkpoint object identity")
+        return self._projections / f"{content_object}.safetensors"
+
+    @staticmethod
+    def _projection_available(projection: Path) -> bool:
+        if projection.is_symlink():
+            projection.unlink(missing_ok=True)
+            return False
+        return projection.is_file()
+
+    def _temporary_path(self, operation: str, prefix_id: str) -> Path:
+        descriptor, value = tempfile.mkstemp(
+            dir=self._projections,
+            prefix=f".{operation}-{prefix_id}-",
+            suffix=".safetensors",
+        )
+        os.close(descriptor)
+        return Path(value)
+
 
 def configured_computation_persistence(
     model_id: str,
@@ -320,6 +398,25 @@ def _prefix_id(runtime_profile: str, tokens: mx.array) -> str:
 
 def _digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _is_lower_hex(value: str, length: int) -> bool:
+    return len(value) == length and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _is_representation_digest(value: str) -> bool:
+    algorithm, separator, digest = value.partition(":")
+    return (
+        separator == ":"
+        and bool(algorithm)
+        and all(
+            character in "abcdefghijklmnopqrstuvwxyz0123456789-"
+            for character in algorithm
+        )
+        and _is_lower_hex(digest, 64)
+    )
 
 
 def _content_name(profile_id: str, prefix_id: str) -> str:
