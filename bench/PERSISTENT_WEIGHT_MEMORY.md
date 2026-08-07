@@ -39,6 +39,14 @@ Attenuating the pilot did not expose a safe global operating point:
 | 10 | 22/32 | Heavily contaminated |
 | 5 | 14/32 | Still contaminated |
 
+Explicit scoping is cheap enough to be the safety mechanism rather than a
+numeric compromise. Across five fresh processes, attaching the 31.25 MiB
+adapter to an already constructed model took 7.46-8.02 ms. MLX materializes
+some work lazily, so a separate one-token probe included the first use: median
+prompt-plus-token time was 0.476 seconds on the base and 0.511 seconds with the
+expert active, about 7.5% overhead. These are local M2 Ultra microbenchmarks,
+not full-generation throughput claims.
+
 Teacher-forced validation loss was not a sufficient gate. One wider run
 reached 0.030 validation loss and then scored only 13/32 under free generation.
 Production evaluation must therefore cross a fresh-process generation

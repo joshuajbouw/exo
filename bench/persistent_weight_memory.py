@@ -91,6 +91,7 @@ class GeneratedCaseResult:
 class ControlResult:
     prompt: str
     response: str
+    generation_seconds: float
 
 
 def _case_id(split: Split, prompt: str, decision: Decision) -> str:
@@ -443,9 +444,12 @@ def generate_evaluate(
 ) -> None:
     load_started = time.perf_counter()
     model, tokenizer = load(str(model_id))
+    base_load_seconds = time.perf_counter() - load_started
+    adapter_load_started = time.perf_counter()
     if adapter_path is not None:
         model = load_adapters(model, str(adapter_path))
     model.eval()
+    adapter_load_seconds = time.perf_counter() - adapter_load_started
     load_seconds = time.perf_counter() - load_started
     decision_pattern = re.compile(r"DECISION:\s*(EXECUTE|RECOMPUTE|REFUSE|REUSE)")
 
@@ -497,6 +501,8 @@ def generate_evaluate(
             if adapter_path is not None
             else None
         ),
+        "adapter_load_seconds": adapter_load_seconds,
+        "base_load_seconds": base_load_seconds,
         "decision_correct": decision_correct,
         "decision_gate": decision_correct >= required_correct,
         "evaluation_seconds": time.perf_counter() - evaluation_started,
@@ -539,9 +545,12 @@ def generate_controls(
 ) -> None:
     load_started = time.perf_counter()
     model, tokenizer = load(str(model_id))
+    base_load_seconds = time.perf_counter() - load_started
+    adapter_load_started = time.perf_counter()
     if adapter_path is not None:
         model = load_adapters(model, str(adapter_path))
     model.eval()
+    adapter_load_seconds = time.perf_counter() - adapter_load_started
     load_seconds = time.perf_counter() - load_started
 
     results: list[ControlResult] = []
@@ -551,15 +560,18 @@ def generate_controls(
             tokenize=False,
             add_generation_prompt=True,
         )
+        generation_started = time.perf_counter()
+        response = generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            sampler=make_sampler(temp=0),
+        ).strip()
         result = ControlResult(
             prompt=control_prompt,
-            response=generate(
-                model,
-                tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
-                sampler=make_sampler(temp=0),
-            ).strip(),
+            response=response,
+            generation_seconds=time.perf_counter() - generation_started,
         )
         results.append(result)
         if not quiet:
@@ -574,6 +586,8 @@ def generate_controls(
             if adapter_path is not None
             else None
         ),
+        "adapter_load_seconds": adapter_load_seconds,
+        "base_load_seconds": base_load_seconds,
         "load_seconds": load_seconds,
         "results": [asdict(result) for result in results],
     }
