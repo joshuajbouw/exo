@@ -174,6 +174,7 @@ class FakeExoBatchGenerator:
         on_prefill_progress: object = None,
         distributed_prompt_progress_callback: object = None,
         on_generation_token: object = None,
+        response_id: object = None,
     ) -> int:
         uid = self._uid_counter
         self._uid_counter += 1

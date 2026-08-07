@@ -129,6 +129,7 @@ class TextGenerationTaskParams(BaseModel, frozen=True):
     repetition_context_size: int | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    previous_response_id: str | None = None
     images: list[Base64Image] = Field(default_factory=list)
     image_hashes: dict[int, Base64ImageHash] = Field(default_factory=dict)
 

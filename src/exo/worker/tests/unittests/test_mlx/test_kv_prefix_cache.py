@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import KVCache
+from mlx_lm.generate import GenerationBatch
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_sampler
 
 from exo.shared.types.common import ModelId
@@ -15,12 +16,22 @@ from exo.worker.engines.mlx.cache import (
     KVPrefixCache,
     cache_length,
     encode_prompt,
+    fork_kv_cache_for_append,
     get_prefix_length,
     make_kv_cache,
 )
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
-from exo.worker.engines.mlx.generator.generate import mlx_generate, prefill
-from exo.worker.engines.mlx.types import Model
+from exo.worker.engines.mlx.generator.generate import (
+    append_only_continuation_tokens,
+    mlx_generate,
+    prefill,
+)
+from exo.worker.engines.mlx.patches.opt_batch_gen import (
+    _patched_extract_cache,
+    _patched_step,
+    prepare_for_batch_extension,
+)
+from exo.worker.engines.mlx.types import ContinuationFrontier, Model
 from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 from exo.worker.tests.unittests.test_mlx.conftest import (
     DEFAULT_GPT_OSS_CONFIG,
@@ -30,6 +41,198 @@ from exo.worker.tests.unittests.test_mlx.conftest import (
 
 def _check_model_exists() -> bool:
     return DEFAULT_GPT_OSS_CONFIG.model_path.exists()
+
+
+class _GemmaContinuationTokenizer:
+    bos_token = "<bos>"
+    has_thinking = False
+
+    @staticmethod
+    def encode(value: str, add_special_tokens: bool = False) -> list[int]:
+        return [ord(character) for character in value]
+
+    @staticmethod
+    def decode(tokens: list[int]) -> str:
+        if tokens == [999]:
+            return "<turn|>"
+        return "".join(chr(token) for token in tokens)
+
+
+def test_append_only_continuation_preserves_private_frontier():
+    tokenizer = _GemmaContinuationTokenizer()
+    task = TextGenerationTaskParams(
+        model=ModelId("gemma"),
+        input=[InputMessage(role="user", content="new turn")],
+    )
+    frontier = ContinuationFrontier(mx.array([10, 999]), 999)
+    prompt = "<bos><|turn>user\nnew turn<turn|>\n<|turn>model\n"
+
+    continued = append_only_continuation_tokens(
+        tokenizer,  # type: ignore[arg-type]
+        task,
+        prompt,
+        frontier,
+    )
+
+    assert continued is not None
+    expected_suffix = tokenizer.encode("\n" + prompt.removeprefix("<bos>"))
+    assert mx.array_equal(
+        continued.tokens,
+        mx.concatenate([frontier.tokens, mx.array(expected_suffix)]),
+    )
+
+
+def test_append_only_continuation_rejects_ambiguous_request_shape():
+    tokenizer = _GemmaContinuationTokenizer()
+    task = TextGenerationTaskParams(
+        model=ModelId("gemma"),
+        input=[InputMessage(role="user", content="new turn")],
+        instructions="changed system policy",
+    )
+
+    assert (
+        append_only_continuation_tokens(
+            tokenizer,  # type: ignore[arg-type]
+            task,
+            "<bos><|turn>user\nnew turn<turn|>",
+            ContinuationFrontier(mx.array([10, 999]), 999),
+        )
+        is None
+    )
+
+
+def test_singleton_generation_cache_transfers_without_extraction_copy():
+    entry = KVCache()
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch.uids = [7]
+    batch.prompt_cache = [entry]
+
+    extracted = _patched_extract_cache(batch, 0)
+
+    assert extracted == [entry]
+    assert extracted[0] is entry
+
+
+def test_append_fork_does_not_mutate_response_frontier():
+    keys = mx.arange(3).reshape(1, 1, 3, 1).astype(mx.float32)
+    values = (keys + 10).astype(mx.float32)
+    global_cache = KVCache()
+    global_cache.update_and_fetch(keys, values)
+    local_cache = RotatingKVCache(max_size=8)
+    local_cache.update_and_fetch(keys, values)
+    original_global = mx.array(global_cache.keys)
+    original_local = mx.array(local_cache.keys)
+
+    forked = fork_kv_cache_for_append(
+        [global_cache, local_cache],
+        token_count=3,
+        append_count=2,
+    )
+
+    assert forked is not None
+    appended = mx.array([20, 21]).reshape(1, 1, 2, 1).astype(mx.float32)
+    for entry in forked:
+        entry.update_and_fetch(appended, appended + 10)
+    mx.eval(
+        global_cache.keys,
+        local_cache.keys,
+        forked[0].keys,
+        forked[1].keys,
+    )
+    assert global_cache.offset == 3
+    assert local_cache.offset == 3
+    assert mx.array_equal(global_cache.keys, original_global)
+    assert mx.array_equal(local_cache.keys, original_local)
+    assert forked[0].offset == 5
+    assert forked[1].offset == 5
+
+
+def test_append_fork_rejects_single_token_before_it_can_write_shared_arrays():
+    cache = KVCache()
+    cache.update_and_fetch(
+        mx.zeros((1, 1, 1, 1)),
+        mx.zeros((1, 1, 1, 1)),
+    )
+
+    assert fork_kv_cache_for_append([cache], 1, 1) is None
+
+
+def test_primed_batch_returns_first_token_without_advancing_cache():
+    entry = KVCache()
+    entry.offset = 3
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch._direct_generation = True
+    batch._primed_response_pending = True
+    batch._next_tokens = mx.array([7])
+    batch._next_logprobs = mx.zeros((1, 8))
+    batch.tokens = [[1, 2, 3]]
+    batch.prompt_cache = [entry]
+
+    tokens, logprobs = _patched_step(batch)
+
+    assert tokens == [7]
+    assert len(logprobs) == 1
+    assert batch.tokens == [[1, 2, 3, 7]]
+    assert entry.offset == 3
+
+
+def test_pending_primed_batch_reverts_before_a_concurrent_insert():
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch._direct_generation = True
+    batch._primed_response_pending = True
+
+    prepare_for_batch_extension(batch)
+
+    assert not batch._direct_generation
+    assert batch._primed_response_pending
+
+
+def test_returned_primed_batch_advances_before_a_concurrent_insert():
+    class NextTokenModel:
+        def __call__(self, tokens, cache):
+            del tokens, cache
+            return mx.array([[[0.0, 1.0, 2.0, 3.0]]])
+
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch._direct_generation = True
+    batch._primed_response_pending = False
+    batch._next_tokens = mx.array([2])
+    batch._next_logprobs = mx.zeros((1, 4))
+    batch.tokens = [[1, 2]]
+    batch.prompt_cache = []
+    batch.model = NextTokenModel()
+    batch.samplers = [None]
+    batch.fallback_sampler = lambda scores: mx.argmax(scores, axis=-1)
+    batch.uids = [7]
+
+    prepare_for_batch_extension(batch)
+
+    assert not batch._direct_generation
+    assert batch._next_tokens.tolist() == [3]
+    assert batch.tokens == [[1, 2]]
+
+
+def test_continuation_replays_token_trailing_a_lagged_cache():
+    prefix_cache = KVPrefixCache(None)
+    entry = KVCache()
+    entry.offset = 3
+    prefix_cache.adopt_kv_cache(
+        mx.array([1, 2, 3, 4]),
+        [entry],
+        continuation_id="response",
+    )
+
+    forked, remaining, matched_index, is_exact = prefix_cache.get_kv_cache(
+        object(),  # type: ignore[arg-type]
+        mx.array([1, 2, 3, 4, 5, 6]),
+        prefer_persistent_fork=True,
+    )
+
+    assert matched_index is None
+    assert not is_exact
+    assert cache_length(forked) == 3
+    assert remaining.tolist() == [4, 5, 6]
+    assert entry.offset == 3
 
 
 class TestGetPrefixLength:
@@ -152,6 +355,32 @@ class TestKVPrefix:
         assert index == 0
         assert cache.caches[0] is owned
 
+    def test_adopt_binds_response_to_immutable_frontier(self):
+        cache = KVPrefixCache(None)
+        frontier = mx.array([1, 2, 3])
+
+        index = cache.adopt_kv_cache(
+            frontier,
+            [KVCache()],
+            continuation_id="resp-a",
+        )
+
+        assert cache.is_continuation_entry(index)
+        resolved = cache.resolve_continuation("resp-a")
+        assert resolved is not None
+        assert mx.array_equal(resolved.tokens, frontier)
+        assert resolved.terminal_token == 3
+        assert cache.resolve_continuation("resp-unknown") is None
+
+        with pytest.raises(ValueError, match="immutable"):
+            cache.update_kv_cache(
+                index,
+                mx.array([1, 2, 3, 4]),
+                [KVCache()],
+                snapshots=None,
+                restore_pos=3,
+            )
+
     def test_adopt_update_transfers_cache_without_copying(self, mock_tokenizer):
         cache = KVPrefixCache(None)
         cache.add_kv_cache(mx.array([1, 2, 3]), [KVCache()])
@@ -191,6 +420,8 @@ class TestKVPrefix:
 
         cache.adopt_kv_cache(mx.array([1, 2, 3]), [KVCache()])
 
+        assert persistence.thread_bound == 0
+        assert cache.flush_pending_persistence() == 1
         assert persistence.thread_bound == 1
         assert persistence.regular == 0
 

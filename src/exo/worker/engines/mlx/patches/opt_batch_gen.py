@@ -1,10 +1,56 @@
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Callable, Protocol, cast
 
 import mlx.core as mx
 from mlx_lm.generate import GenerationBatch
+from mlx_lm.models.cache import (
+    TokenBuffer,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]
+)
+
+from exo.worker.engines.mlx.types import KVCacheType, Model
 
 _PRECOMPUTE_TOP_K = 20
+_ORIGINAL_EXTRACT_CACHE = GenerationBatch.extract_cache
+
+
+class GenerationStateMachine(Protocol):
+    def make_state(self) -> object: ...
+
+
+def make_primed_generation_batch(
+    model: Model,
+    uid: int,
+    sampled: mx.array,
+    logprobs: mx.array,
+    prompt_cache: KVCacheType,
+    all_tokens: list[int],
+    sampler: Callable[[mx.array], mx.array],
+    fallback_sampler: Callable[[mx.array], mx.array],
+    logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
+    state_machine: GenerationStateMachine,
+    max_tokens: int,
+) -> GenerationBatch:
+    """Build a generation batch whose first token was sampled during prefill."""
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch.model = model
+    batch.uids = [uid]
+    batch.prompt_cache = list(prompt_cache)
+    batch.tokens = [list(all_tokens)]
+    batch.samplers = [sampler]
+    batch.fallback_sampler = fallback_sampler
+    batch.logits_processors = [logits_processors]
+    batch.state_machines = [state_machine]  # pyright: ignore[reportAttributeAccessIssue]
+    batch.max_tokens = [max_tokens]
+    batch._current_tokens = None
+    batch._current_logprobs = []
+    batch._next_tokens = sampled
+    batch._next_logprobs = logprobs
+    batch._direct_generation = True  # pyright: ignore[reportAttributeAccessIssue]
+    batch._primed_response_pending = True  # pyright: ignore[reportAttributeAccessIssue]
+    batch._token_context = [TokenBuffer(all_tokens)]
+    batch._num_tokens = [0]
+    batch._matcher_states = [state_machine.make_state()]
+    return batch
 
 
 @dataclass
@@ -55,6 +101,9 @@ def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
 
 
 def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
+    if getattr(self, "_direct_generation", False):
+        return _direct_step(self)
+
     self._current_tokens = self._next_tokens
     self._current_logprobs = self._next_logprobs
     inputs = self._current_tokens
@@ -132,5 +181,87 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     return token_list, current_lp
 
 
+def _direct_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
+    """Return a primed token before computing, then advance without speculation.
+
+    The prompt cache intentionally trails the returned token by one position.
+    A later continuation includes that identified token in its next append, so
+    terminal requests do not compute logits that nobody asked for.
+    """
+    inputs = self._next_tokens
+    assert inputs is not None, "direct generation requires a primed token"
+    current_logprobs = self._next_logprobs
+
+    if cast(bool, self._primed_response_pending):  # pyright: ignore[reportAttributeAccessIssue]
+        self._primed_response_pending = False  # pyright: ignore[reportAttributeAccessIssue]
+        if isinstance(current_logprobs, mx.array):
+            mx.eval(inputs, current_logprobs)
+        else:
+            mx.eval(inputs, *current_logprobs)
+        token_list = cast(list[int], inputs.tolist())
+        for tokens, token in zip(self.tokens, token_list, strict=True):
+            tokens.append(token)
+        if isinstance(current_logprobs, mx.array):
+            current_logprobs = list(current_logprobs)
+        return token_list, current_logprobs
+
+    sampled, logprobs = _advance_direct_state(self, inputs)
+    self._next_tokens = sampled
+    self._next_logprobs = logprobs
+    token_list = cast(list[int], sampled.tolist())
+    for tokens, token in zip(self.tokens, token_list, strict=True):
+        tokens.append(token)
+    return token_list, list(logprobs)
+
+
+def _advance_direct_state(
+    batch: GenerationBatch,
+    inputs: mx.array,
+) -> tuple[mx.array, mx.array]:
+    logits = batch.model(inputs[:, None], cache=batch.prompt_cache)[:, -1, :]
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    if batch.samplers is not None and any(batch.samplers):
+        samples = [
+            (batch.samplers[index] or batch.fallback_sampler)(
+                logprobs[index : index + 1]
+            )
+            for index in range(len(batch.uids))
+        ]
+        sampled = mx.concatenate(samples, axis=0)
+    else:
+        sampled = batch.fallback_sampler(logprobs)
+
+    mx.eval(sampled, logprobs)
+    return sampled, logprobs
+
+
+def prepare_for_batch_extension(batch: GenerationBatch) -> None:
+    """Convert a direct singleton back to MLX's mergeable batch semantics."""
+    if not getattr(batch, "_direct_generation", False):
+        return
+    if cast(bool, batch._primed_response_pending):  # pyright: ignore[reportAttributeAccessIssue]
+        batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
+        return
+    inputs = batch._next_tokens
+    assert inputs is not None
+    sampled, logprobs = _advance_direct_state(batch, inputs)
+    batch._next_tokens = sampled
+    batch._next_logprobs = logprobs
+    batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _patched_extract_cache(self: GenerationBatch, idx: int) -> list[object]:
+    """Transfer an unbatched singleton cache without a full contiguous copy."""
+    prompt_cache = cast(list[object], self.prompt_cache)
+    if (
+        len(self.uids) == 1
+        and idx == 0
+        and all(not hasattr(entry, "extract") for entry in prompt_cache)
+    ):
+        return list(prompt_cache)
+    return cast(list[object], _ORIGINAL_EXTRACT_CACHE(self, idx))
+
+
 def apply_batch_gen_patch() -> None:
     GenerationBatch._step = _patched_step
+    GenerationBatch.extract_cache = _patched_extract_cache

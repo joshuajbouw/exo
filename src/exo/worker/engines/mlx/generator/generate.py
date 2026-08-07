@@ -6,6 +6,7 @@ import uuid
 from typing import Callable, Generator, cast, get_args
 
 import mlx.core as mx
+import numpy as np
 from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
@@ -56,7 +57,12 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
-from exo.worker.engines.mlx.types import KVCacheType, Model
+from exo.worker.engines.mlx.types import (
+    ContinuationFrontier,
+    ContinuationPrompt,
+    KVCacheType,
+    Model,
+)
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
     fix_unmatched_think_end_tokens,
@@ -77,6 +83,49 @@ REMOTE_PREFILL_MIN_TOKENS = 1000
 generation_stream = mx.new_stream(mx.default_device())
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
+
+
+def append_only_continuation_tokens(
+    tokenizer: TokenizerWrapper,
+    task: TextGenerationTaskParams,
+    prompt: str,
+    frontier: ContinuationFrontier,
+) -> ContinuationPrompt | None:
+    """Append one plain Gemma user turn without re-rendering private history.
+
+    The fast path is intentionally narrower than the chat-template surface.
+    Unsupported request shapes fall back to ordinary transcript rendering.
+    """
+    if (
+        len(task.input) != 1
+        or task.input[0].role != "user"
+        or task.instructions is not None
+        or task.tools
+        or task.chat_template_messages is not None
+        or task.images
+    ):
+        return None
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if (
+        not isinstance(bos_token, str)
+        or not prompt.startswith(f"{bos_token}<|turn>user\n")
+        or len(frontier.tokens) == 0
+        or tokenizer.decode([frontier.terminal_token]) != "<turn|>"
+    ):
+        return None
+    suffix = fix_unmatched_think_end_tokens(
+        encode_prompt(tokenizer, "\n" + prompt[len(bos_token) :]),
+        tokenizer,
+    )
+    suffix_bytes = np.asarray(suffix, dtype="<u4").tobytes(order="C")
+    return ContinuationPrompt(
+        mx.concatenate([frontier.tokens, suffix]),
+        (
+            frontier.token_bytes + suffix_bytes
+            if frontier.token_bytes is not None
+            else None
+        ),
+    )
 
 
 @contextlib.contextmanager
@@ -540,6 +589,7 @@ def mlx_generate(
     distributed_prompt_progress_callback: Callable[[], None] | None = None,
     on_generation_token: Callable[[], None] | None = None,
     vision_processor: VisionProcessor | None = None,
+    response_id: str | None = None,
 ) -> Generator[GenerationResponse]:
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
@@ -549,7 +599,24 @@ def mlx_generate(
 
     # Encode prompt once at the top and fix unmatched think tags
     all_prompt_tokens = encode_prompt(tokenizer, prompt)
-    all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
+    continuation_used = False
+    continuation_token_bytes: bytes | None = None
+    if task.previous_response_id is not None:
+        if kv_prefix_cache is None:
+            raise ValueError("previous_response_id requires a prefix cache")
+        frontier = kv_prefix_cache.resolve_continuation(task.previous_response_id)
+        if frontier is None:
+            raise ValueError("previous_response_id is unknown or expired")
+        continued = append_only_continuation_tokens(tokenizer, task, prompt, frontier)
+        if continued is None:
+            raise ValueError(
+                "this model or request shape does not support exact continuation"
+            )
+        all_prompt_tokens = continued.tokens
+        continuation_token_bytes = continued.token_bytes
+        continuation_used = True
+    if not continuation_used:
+        all_prompt_tokens = fix_unmatched_think_end_tokens(all_prompt_tokens, tokenizer)
     min_prefix_hit_length = max(1000, system_prompt_token_count(task, tokenizer))
 
     vision: VisionResult | None = None
@@ -587,7 +654,11 @@ def mlx_generate(
     else:
         caches, prompt_tokens, matched_index, is_exact_hit = (
             kv_prefix_cache.get_kv_cache(
-                model, all_prompt_tokens, media_regions=media_regions
+                model,
+                all_prompt_tokens,
+                media_regions=media_regions,
+                prefer_persistent_fork=continuation_used,
+                prompt_token_bytes=continuation_token_bytes,
             )
         )
         prefix_hit_length = len(all_prompt_tokens) - len(prompt_tokens)
@@ -684,9 +755,17 @@ def mlx_generate(
             if len(all_prompt_tokens) > 0
             else 0.0
         )
-        if matched_index is not None and (
-            prefix_hit_length >= min_prefix_hit_length
-            and hit_ratio >= _MIN_PREFIX_HIT_RATIO_TO_UPDATE
+        preserve_match = continuation_used or (
+            matched_index is not None
+            and kv_prefix_cache.is_continuation_entry(matched_index)
+        )
+        if (
+            matched_index is not None
+            and not preserve_match
+            and (
+                prefix_hit_length >= min_prefix_hit_length
+                and hit_ratio >= _MIN_PREFIX_HIT_RATIO_TO_UPDATE
+            )
         ):
             kv_prefix_cache.update_kv_cache(
                 matched_index,
@@ -825,6 +904,8 @@ def mlx_generate(
                     cache_snapshots,
                     media_regions=media_regions,
                     prefill_tps=prefill_tps,
+                    continuation_id=response_id,
+                    continuation_terminal_token=generated_token_ids[-1],
                 )
             else:
                 kv_prefix_cache.adopt_kv_cache_update(
@@ -835,6 +916,8 @@ def mlx_generate(
                     restore_pos=len(all_prompt_tokens),
                     media_regions=media_regions,
                     prefill_tps=prefill_tps,
+                    continuation_id=response_id,
+                    continuation_terminal_token=generated_token_ids[-1],
                 )
 
         yield GenerationResponse(
@@ -848,6 +931,8 @@ def mlx_generate(
         )
 
         if is_done:
+            if kv_prefix_cache is not None:
+                kv_prefix_cache.flush_pending_persistence(limit=1)
             mx_barrier(group)
             break
 

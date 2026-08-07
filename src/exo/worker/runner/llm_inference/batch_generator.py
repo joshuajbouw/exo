@@ -295,6 +295,7 @@ class SequentialGenerator(Engine):
             on_generation_token=on_generation_token,
             group=self.group,
             vision_processor=self.vision_processor,
+            response_id=f"resp_{task.command_id}",
         )
 
     def close(self) -> None:
@@ -436,6 +437,12 @@ class BatchGenerator(Engine):
             self._active_tasks[uid] = (task, queue, output_generator)
 
         if not self._gen.has_work:
+            if (
+                self.kv_prefix_cache is not None
+                and not self._queue
+                and not self._maybe_queue
+            ):
+                self.kv_prefix_cache.flush_pending_persistence(limit=1)
             return self._apply_cancellations()
 
         results = self._gen.step()
@@ -551,6 +558,7 @@ class BatchGenerator(Engine):
             on_prefill_progress=on_prefill_progress,
             distributed_prompt_progress_callback=distributed_prompt_progress_callback,
             on_generation_token=on_generation_token,
+            response_id=f"resp_{task.command_id}",
         )
 
     def close(self) -> None:

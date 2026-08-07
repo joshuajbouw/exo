@@ -1,6 +1,7 @@
 """Shared types for MLX-related functionality."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from mlx import core as mx
 from mlx import nn as nn
@@ -22,6 +23,23 @@ KVCacheType = Sequence[
     | CacheList
     | DeepseekV4Cache
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationFrontier:
+    """Exact private tokens and their already-verified terminal token."""
+
+    tokens: mx.array
+    terminal_token: int
+    token_bytes: bytes | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationPrompt:
+    """Device tokens plus canonical CPU bytes when durably available."""
+
+    tokens: mx.array
+    token_bytes: bytes | None
 
 
 # Model is a wrapper function to fix the fact that mlx is not strongly typed in the same way that EXO is.

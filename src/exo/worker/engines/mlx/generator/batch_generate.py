@@ -1,8 +1,9 @@
 import contextlib
 import time
 import uuid
+from copy import copy
 from dataclasses import dataclass, field
-from typing import Callable, Literal, cast
+from typing import Callable, Literal, Protocol, cast
 
 import mlx.core as mx
 from mlx_lm.generate import (
@@ -10,6 +11,7 @@ from mlx_lm.generate import (
 )
 from mlx_lm.generate import (
     generation_stream,
+    maybe_quantize_kv_cache,
 )
 from mlx_lm.models.cache import RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
@@ -32,8 +34,14 @@ from exo.worker.engines.mlx.cache import (
     encode_prompt,
     make_kv_cache,
 )
-from exo.worker.engines.mlx.constants import DEFAULT_TOP_LOGPROBS, MAX_TOKENS
+from exo.worker.engines.mlx.constants import (
+    DEFAULT_TOP_LOGPROBS,
+    KV_BITS,
+    KV_GROUP_SIZE,
+    MAX_TOKENS,
+)
 from exo.worker.engines.mlx.generator.generate import (
+    append_only_continuation_tokens,
     ban_token_ids,
     eos_ids_from_tokenizer,
     extract_top_logprobs,
@@ -42,6 +50,9 @@ from exo.worker.engines.mlx.generator.generate import (
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
+    GenerationStateMachine,
+    make_primed_generation_batch,
+    prepare_for_batch_extension,
     set_needs_topk,
     take_ready_topk,
 )
@@ -60,6 +71,13 @@ from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
 REMOTE_PREFILL_MIN_TOKENS = 1000
+
+
+class _BatchGeneratorInternals(Protocol):
+    _uid_count: int
+    sampler: Callable[[mx.array], mx.array]
+    _default_state_machine: GenerationStateMachine
+    _generation_batch: object
 
 
 def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
@@ -87,6 +105,7 @@ class _EngineTask:
     prefill_tps: float = 0.0
     prefix_cache_hit: Literal["none", "partial", "exact"] = "none"
     media_regions: list[MediaRegion] = field(default_factory=list)
+    response_id: str | None = None
     first_gen_token_time: float | None = None
     last_gen_token_time: float | None = None
 
@@ -100,6 +119,7 @@ class ExoBatchGenerator:
     vision_processor: VisionProcessor | None = None
 
     _mlx_gen: MlxBatchGenerator = field(init=False)
+    _detokenizer_prototype: StreamingDetokenizer = field(init=False, repr=False)
     _active_tasks: dict[int, _EngineTask] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
@@ -108,7 +128,16 @@ class ExoBatchGenerator:
             stop_tokens=[[t] for t in eos_ids_from_tokenizer(self.tokenizer)],
             prefill_step_size=4096,
         )
+        # SPM/BPE detokenizer construction walks the entire vocabulary.  Its
+        # token map is immutable, so build it once and reset cheap shallow
+        # clones for individual requests.
+        self._detokenizer_prototype = self.tokenizer.detokenizer
         self._step_count = 0
+
+    def _new_detokenizer(self) -> StreamingDetokenizer:
+        detokenizer = copy(self._detokenizer_prototype)
+        detokenizer.reset()
+        return detokenizer
 
     @property
     def has_work(self) -> bool:
@@ -126,11 +155,37 @@ class ExoBatchGenerator:
         on_prefill_progress: Callable[[int, int], None] | None = None,
         distributed_prompt_progress_callback: Callable[[], None] | None = None,
         on_generation_token: Callable[[], None] | None = None,
+        response_id: str | None = None,
     ) -> int:
+        prepare_for_batch_extension(self._mlx_gen._generation_batch)
         all_prompt_tokens = encode_prompt(self.tokenizer, prompt)
-        all_prompt_tokens = fix_unmatched_think_end_tokens(
-            all_prompt_tokens, self.tokenizer
-        )
+        continuation_used = False
+        continuation_token_bytes: bytes | None = None
+        if task_params.previous_response_id is not None:
+            if self.kv_prefix_cache is None:
+                raise ValueError("previous_response_id requires a prefix cache")
+            frontier = self.kv_prefix_cache.resolve_continuation(
+                task_params.previous_response_id
+            )
+            if frontier is None:
+                raise ValueError("previous_response_id is unknown or expired")
+            continued = append_only_continuation_tokens(
+                self.tokenizer,
+                task_params,
+                prompt,
+                frontier,
+            )
+            if continued is None:
+                raise ValueError(
+                    "this model or request shape does not support exact continuation"
+                )
+            all_prompt_tokens = continued.tokens
+            continuation_token_bytes = continued.token_bytes
+            continuation_used = True
+        if not continuation_used:
+            all_prompt_tokens = fix_unmatched_think_end_tokens(
+                all_prompt_tokens, self.tokenizer
+            )
 
         vision: VisionResult | None = None
         media_regions: list[MediaRegion] = []
@@ -167,7 +222,11 @@ class ExoBatchGenerator:
         ):
             cache, remaining_tokens, matched_index, is_exact_hit = (
                 self.kv_prefix_cache.get_kv_cache(
-                    self.model, all_prompt_tokens, media_regions=media_regions
+                    self.model,
+                    all_prompt_tokens,
+                    media_regions=media_regions,
+                    prefer_persistent_fork=continuation_used,
+                    prompt_token_bytes=continuation_token_bytes,
                 )
             )
             prefix_hit_length = len(all_prompt_tokens) - len(remaining_tokens)
@@ -191,6 +250,96 @@ class ExoBatchGenerator:
             min_p=task_params.min_p if task_params.min_p is not None else 0.05,
             top_k=task_params.top_k if task_params.top_k is not None else 0,
         )
+
+        logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
+            make_logits_processors(
+                repetition_penalty=task_params.repetition_penalty,
+                repetition_context_size=task_params.repetition_context_size
+                if task_params.repetition_context_size is not None
+                else 20,
+                presence_penalty=task_params.presence_penalty,
+                frequency_penalty=task_params.frequency_penalty,
+            )
+        )
+        if is_bench:
+            eos_ids = eos_ids_from_tokenizer(self.tokenizer)
+            logits_processors = [ban_token_ids(eos_ids)] + logits_processors
+
+        max_tokens = task_params.max_output_tokens or MAX_TOKENS
+        can_fuse_continuation = (
+            continuation_used
+            and self.group is None
+            and vision is None
+            and not task_params.logprobs
+            and not logits_processors
+            and prefix_hit_length > 0
+            and 0 < len(prompt_tokens) <= 256
+            and len(self._mlx_gen._generation_batch) == 0
+            and len(self._mlx_gen._prompt_batch) == 0
+            and not self._mlx_gen._unprocessed_sequences
+        )
+        if can_fuse_continuation:
+            # The continuation cache is an independent fork at its exact
+            # frontier, so appending never needs rollback snapshots.  Cache
+            # types such as RotatingKVCache are unsafe to *trim*, but are safe
+            # to extend here; routing them through generic prefill needlessly
+            # copied every layer before doing the same model call.
+            started = time.perf_counter()
+            if on_prefill_progress is not None:
+                on_prefill_progress(0, len(prompt_tokens))
+            with mx.stream(generation_stream):
+                logits = self.model(prompt_tokens[None], cache=cache)[:, -1, :]
+                for processor in logits_processors:
+                    logits = processor(all_prompt_tokens, logits)
+                logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                sampled = sampler(logprobs)
+                maybe_quantize_kv_cache(
+                    cache,
+                    quantized_kv_start=0,
+                    kv_group_size=KV_GROUP_SIZE,
+                    kv_bits=KV_BITS,
+                )
+                mx.eval(
+                    sampled,
+                    logprobs,
+                    [entry.state for entry in cache],  # pyright: ignore[reportArgumentType]
+                )
+            if on_prefill_progress is not None:
+                on_prefill_progress(len(prompt_tokens), len(prompt_tokens))
+            elapsed = time.perf_counter() - started
+            prefill_tps = len(prompt_tokens) / elapsed if elapsed > 0 else 0.0
+            internals = cast(_BatchGeneratorInternals, cast(object, self._mlx_gen))
+            uid = internals._uid_count  # pyright: ignore[reportPrivateUsage]
+            internals._uid_count += 1  # pyright: ignore[reportPrivateUsage]
+            primed = make_primed_generation_batch(
+                self.model,
+                uid,
+                sampled,
+                logprobs,
+                list(cache),
+                cast(list[int], all_prompt_tokens.tolist()),
+                sampler,
+                internals.sampler,
+                logits_processors,
+                internals._default_state_machine,  # pyright: ignore[reportPrivateUsage]
+                max_tokens,
+            )
+            internals._generation_batch = primed  # pyright: ignore[reportPrivateUsage]
+            self._active_tasks[uid] = _EngineTask(
+                uid=uid,
+                task_params=task_params,
+                all_prompt_tokens=all_prompt_tokens,
+                prefix_hit_length=prefix_hit_length,
+                matched_index=None,
+                detokenizer=self._new_detokenizer(),
+                on_generation_token=on_generation_token,
+                generation_start_time=time.perf_counter(),
+                prefill_tps=prefill_tps,
+                prefix_cache_hit="partial",
+                media_regions=media_regions,
+                response_id=response_id,
+            )
+            return uid
 
         vision_ctx = (
             patch_embed_tokens(
@@ -265,39 +414,28 @@ class ExoBatchGenerator:
                 c.values = c._trim(trim_size, c.values)
                 c._idx = c.max_size
 
-        if not is_bench or task_params.use_prefix_cache:
+        if self.kv_prefix_cache is not None and (
+            not is_bench or task_params.use_prefix_cache
+        ):
             min_prefix_hit_length = max(
                 1000, system_prompt_token_count(task_params, self.tokenizer)
+            )
+            preserve_match = continuation_used or (
+                matched_index is not None
+                and self.kv_prefix_cache.is_continuation_entry(matched_index)
             )
             matched_index = self._save_prefix_cache(
                 all_prompt_tokens,
                 list(cache),
                 cache_snapshots,
                 prefix_hit_length,
-                matched_index,
+                None if preserve_match else matched_index,
                 min_prefix_hit_length,
                 media_regions,
                 prefill_tps=_prefill_tps,
             )
 
         last_tokens = prompt_tokens[-2:]
-
-        logits_processors: list[Callable[[mx.array, mx.array], mx.array]] = (
-            make_logits_processors(
-                repetition_penalty=task_params.repetition_penalty,
-                repetition_context_size=task_params.repetition_context_size
-                if task_params.repetition_context_size is not None
-                else 20,
-                presence_penalty=task_params.presence_penalty,
-                frequency_penalty=task_params.frequency_penalty,
-            )
-        )
-        if is_bench:
-            # Only sample length eos tokens
-            eos_ids = eos_ids_from_tokenizer(self.tokenizer)
-            logits_processors = [ban_token_ids(eos_ids)] + logits_processors
-
-        max_tokens = task_params.max_output_tokens or MAX_TOKENS
 
         uids = self._mlx_gen.insert(
             prompts=[cast(list[int], last_tokens.tolist())],
@@ -317,12 +455,13 @@ class ExoBatchGenerator:
             all_prompt_tokens=all_prompt_tokens,
             prefix_hit_length=prefix_hit_length,
             matched_index=matched_index,
-            detokenizer=self.tokenizer.detokenizer,
+            detokenizer=self._new_detokenizer(),
             on_generation_token=on_generation_token,
             generation_start_time=time.perf_counter(),
             prefill_tps=_prefill_tps,
             prefix_cache_hit=prefix_cache_hit,
             media_regions=media_regions,
+            response_id=response_id,
         )
 
         return uid
@@ -481,6 +620,8 @@ class ExoBatchGenerator:
                             response.prompt_cache,
                             media_regions=state.media_regions,
                             prefill_tps=state.prefill_tps,
+                            continuation_id=state.response_id,
+                            continuation_terminal_token=response.token,
                         )
                     else:
                         self.kv_prefix_cache.adopt_kv_cache_update(
@@ -491,6 +632,8 @@ class ExoBatchGenerator:
                             restore_pos=len(state.all_prompt_tokens),
                             media_regions=state.media_regions,
                             prefill_tps=state.prefill_tps,
+                            continuation_id=state.response_id,
+                            continuation_terminal_token=response.token,
                         )
                 del self._active_tasks[response.uid]
             elif (

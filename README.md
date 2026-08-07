@@ -367,8 +367,10 @@ for the end-to-end restart result and its claim boundaries. On an M2 Ultra, a
 tokens reached first output in 3.606 seconds versus 105.805 seconds cold, a
 29.34x end-to-end speedup with the same first token. In the measured two-turn
 conversation, Exo retained the completed assistant frontier and reopened it for
-the next 19-token user turn: median TTFT was 0.368 seconds versus 24.668 seconds
-for a cold replay, a 67.0x speedup with identical output.
+the next 19-token user turn. The live batch path reached first output in 0.296
+seconds versus 24.005 seconds for a cold replay, an 81.2x speedup; reopening
+the same frontier through the durable store after discarding process-local
+state took 0.545 seconds, a 44.1x speedup. Both produced identical output.
 
 ---
 

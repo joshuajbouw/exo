@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
 
-from exo.worker.engines.mlx.types import KVCacheType
+from exo.worker.engines.mlx.types import ContinuationFrontier, KVCacheType
 
 from .cache import CacheSnapshot
 
@@ -44,6 +44,7 @@ class KVPrefixPersistence(Protocol):
         prompt_tokens: mx.array,
         minimum_tokens: int,
         media_regions: list["MediaRegion"],
+        prompt_token_bytes: bytes | None = None,
     ) -> PersistedKVPrefix | None:
         """Restore a matching prefix longer than ``minimum_tokens``."""
 
@@ -54,6 +55,7 @@ class KVPrefixPersistence(Protocol):
         snapshots: list[CacheSnapshot] | None,
         media_regions: list["MediaRegion"],
         prefill_tps: float,
+        continuation_id: str | None = None,
     ) -> None:
         """Schedule durable publication without delaying token generation."""
 
@@ -64,8 +66,12 @@ class KVPrefixPersistence(Protocol):
         snapshots: list[CacheSnapshot] | None,
         media_regions: list["MediaRegion"],
         prefill_tps: float,
+        continuation_id: str | None = None,
     ) -> None:
         """Capture thread-local accelerator state, then publish asynchronously."""
+
+    def resolve_continuation(self, continuation_id: str) -> ContinuationFrontier | None:
+        """Resolve an opaque response identity to its exact token frontier."""
 
     def close(self) -> None:
         """Finish accepted publications and release backend resources."""

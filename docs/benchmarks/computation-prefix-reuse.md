@@ -54,23 +54,37 @@ appends the next user turn. For a 4,093-token Gemma prompt, the model answered
 `OK` in two tokens; both response tokens became part of the 4,095-token private
 frontier. The next user turn added 19 tokens.
 
-| Path | Median TTFT | Best TTFT | Versus cold |
-|---|---:|---:|---:|
-| Full cold replay | 24.668 s | — | 1x |
-| Standard MLX resumed generation | 0.449 s | 0.443 s | 54.9x |
-| One-call short-continuation prototype | **0.368 s** | **0.361 s** | **67.0x** |
+| Path | TTFT | Versus cold |
+|---|---:|---:|
+| Full cold replay | 24.005 s | 1x |
+| Standard synchronous resumed generation | 2.077 s | 11.6x |
+| Fresh-process Exo batch continuation | 0.545 s | **44.1x** |
+| Warm durable one-call median | 0.336 s | **71.5x** |
+| Live Exo batch continuation | **0.296 s** | **81.2x** |
+| Direct in-memory compute control | 0.275 s | 87.3x |
 
-All samples produced the same first token as the cold replay. The durable path
-spent about 70–84 ms reopening and verifying the checkpoint; the remaining
-time evaluated the 19 new tokens. With the completed frontier still resident
-in memory, the one-call path avoids reopening as well.
+Every path produced the same first token as the cold replay. A separate
+three-token run produced the same complete token sequence through the optimized
+batch and standard synchronous paths. The live batch result is within 21 ms of
+the direct model control; its scheduler returned the already-selected first
+token in 0.39 ms. At that point the live serving path has reached the model's
+short-continuation compute floor rather than an Exo cache-management floor.
 
-The one-call result is an optimization target rather than the current Exo
-generation path: it evaluates a short continuation and selects its first token
-in one model invocation. Exo and MLX currently split prefill from first-token
-selection, adding another model invocation. Splitting the vocabulary head from
-the transformer to project only the final hidden state was also measured and
-was slower, so that route was rejected.
+The fresh-process result includes authenticated continuation lookup, a full
+BLAKE3 check of the contiguous projection, MLX cache reconstruction, page-in of
+the checkpoint tensors, the 19-token append, and first-token selection. Warm
+durable samples avoid the initial tensor page-in but still reconstruct a new
+MLX cache view. The live path instead forks the immutable response frontier
+copy-on-write: existing KV tensors remain shared until the multi-token append
+allocates its new state.
+
+Exo's batch path now performs the short append and first-token selection in one
+model call. It returns that primed token without speculatively computing token
+two; the completed cache may trail the returned frontier by one identified
+token, which the next continuation folds into its append. This removes work at
+a terminal boundary without changing later generation. Splitting the
+vocabulary head from the transformer was also measured and was slower, so that
+route was rejected.
 
 Run the benchmark with:
 
@@ -106,11 +120,12 @@ long growing sessions.
 The benchmark continuation is token-prefix-stable by construction. Some
 stateless chat templates are not: they insert generation-only control tokens
 or remove private reasoning when rendering the next request. Reusing raw
-decode state across such a rewrite would change model semantics. The benchmark
-uses Gemma's explicit append contract for the second turn. General API use
-therefore still requires a session/context assembler whose private token
-frontier is append-only; storage alone must not guess that equivalence from a
-re-rendered human transcript.
+decode state across such a rewrite would change model semantics. The Responses
+API therefore carries `previous_response_id`, which resolves the exact private
+frontier rather than reconstructing it from visible messages. The current fast
+path deliberately accepts only Gemma's known plain-user append grammar; other
+models or request shapes fail closed rather than guessing equivalence. A
+general session/context assembler still needs its own append contract.
 
 Checkpoint retention and physical reclamation remain operator policy. A
 production fleet must route those through its computation-sharing domain,

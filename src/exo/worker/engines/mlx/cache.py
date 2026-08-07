@@ -1,7 +1,8 @@
 import gc
 import os
-from copy import deepcopy
-from typing import TYPE_CHECKING
+from collections import deque
+from copy import copy, deepcopy
+from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
 import numpy as np
@@ -23,7 +24,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
-from exo.worker.engines.mlx.types import KVCacheType, Model
+from exo.worker.engines.mlx.types import ContinuationFrontier, KVCacheType, Model
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -242,6 +243,18 @@ class KVPrefixCache:
         self._media_regions: list[list["MediaRegion"]] = []
         self._last_used: list[int] = []  # monotonic counter of last access per entry
         self.prefill_tps: list[float] = []
+        self._continuations: dict[str, int] = {}
+        self._continuation_terminal_tokens: dict[str, int] = {}
+        self._deferred_thread_bound: deque[
+            tuple[
+                mx.array,
+                KVCacheType,
+                list[CacheSnapshot] | None,
+                list["MediaRegion"],
+                float,
+                str | None,
+            ]
+        ] = deque()
         self._access_counter: int = 0
         self._group = group
         self._persistence = persistence
@@ -255,16 +268,29 @@ class KVPrefixCache:
         prefill_tps: float,
         *,
         thread_bound: bool = False,
+        continuation_id: str | None = None,
     ) -> None:
         """Publish an accelerator checkpoint without coupling it to inference."""
         if self._persistence is None:
             return
-        try:
-            schedule_thread_bound = getattr(
-                self._persistence, "schedule_store_thread_bound", None
+        if thread_bound:
+            checkpoint = (
+                prompt_tokens,
+                cache,
+                snapshots,
+                media_regions,
+                prefill_tps,
+                continuation_id,
             )
-            if thread_bound and schedule_thread_bound is not None:
-                schedule_thread_bound(
+            for index in range(len(self._deferred_thread_bound) - 1, -1, -1):
+                if self._deferred_thread_bound[index][5] == continuation_id:
+                    self._deferred_thread_bound[index] = checkpoint
+                    return
+            self._deferred_thread_bound.append(checkpoint)
+            return
+        try:
+            if continuation_id is None:
+                self._persistence.schedule_store(
                     prompt_tokens,
                     cache,
                     snapshots,
@@ -278,11 +304,45 @@ class KVPrefixCache:
                     snapshots,
                     media_regions,
                     prefill_tps,
+                    continuation_id=continuation_id,
                 )
         except Exception:
             logger.opt(exception=True).warning(
                 "KV cache persistence failed; inference result remains valid"
             )
+
+    def flush_pending_persistence(self, limit: int | None = None) -> int:
+        """Serialize completed frontiers on their owning inference thread."""
+        if self._persistence is None:
+            self._deferred_thread_bound.clear()
+            return 0
+        schedule = getattr(self._persistence, "schedule_store_thread_bound", None)
+        if schedule is None:
+            self._deferred_thread_bound.clear()
+            return 0
+        flushed = 0
+        while self._deferred_thread_bound and (limit is None or flushed < limit):
+            prompt, cache, snapshots, media, prefill_tps, continuation_id = (
+                self._deferred_thread_bound.popleft()
+            )
+            try:
+                if continuation_id is None:
+                    schedule(prompt, cache, snapshots, media, prefill_tps)
+                else:
+                    schedule(
+                        prompt,
+                        cache,
+                        snapshots,
+                        media,
+                        prefill_tps,
+                        continuation_id=continuation_id,
+                    )
+                flushed += 1
+            except Exception:
+                logger.opt(exception=True).warning(
+                    "KV cache persistence failed; inference result remains valid"
+                )
+        return flushed
 
     def clear(self):
         """Clear all cached prompts and caches."""
@@ -292,11 +352,15 @@ class KVPrefixCache:
         self._media_regions.clear()
         self._last_used.clear()
         self.prefill_tps.clear()
+        self._continuations.clear()
+        self._continuation_terminal_tokens.clear()
+        self._deferred_thread_bound.clear()
 
     def close(self) -> None:
         """Finish pending durable publication and release its resources."""
         if self._persistence is None:
             return
+        self.flush_pending_persistence()
         self._persistence.close()
         self._persistence = None
 
@@ -333,6 +397,8 @@ class KVPrefixCache:
         ssm_snapshots: list[CacheSnapshot] | None = None,
         media_regions: list["MediaRegion"] | None = None,
         prefill_tps: float = 0.0,
+        continuation_id: str | None = None,
+        continuation_terminal_token: int | None = None,
     ) -> int:
         """Adopt a completed cache without copying it.
 
@@ -357,7 +423,15 @@ class KVPrefixCache:
             list(self._media_regions[-1]),
             prefill_tps,
             thread_bound=True,
+            continuation_id=continuation_id,
         )
+        if continuation_id is not None:
+            self._continuations[continuation_id] = len(self.prompts) - 1
+            self._continuation_terminal_tokens[continuation_id] = (
+                continuation_terminal_token
+                if continuation_terminal_token is not None
+                else int(prompt_tokens[-1].item())
+            )
         logger.info(f"KV cache adopted: {len(prompt_tokens)} tokens")
         return len(self.prompts) - 1
 
@@ -370,6 +444,8 @@ class KVPrefixCache:
         restore_pos: int,
         media_regions: list["MediaRegion"] | None = None,
         prefill_tps: float = 0.0,
+        continuation_id: str | None = None,
+        continuation_terminal_token: int | None = None,
     ) -> None:
         """Replace an entry with a completed cache, taking ownership directly."""
         old_snapshots = self._snapshots[index]
@@ -397,8 +473,54 @@ class KVPrefixCache:
             list(self._media_regions[index]),
             prefill_tps,
             thread_bound=True,
+            continuation_id=continuation_id,
         )
+        self._drop_continuations_for_index(index)
+        if continuation_id is not None:
+            self._continuations[continuation_id] = index
+            self._continuation_terminal_tokens[continuation_id] = (
+                continuation_terminal_token
+                if continuation_terminal_token is not None
+                else int(prompt_tokens[-1].item())
+            )
         logger.info(f"KV cache adopted (index {index}): {len(prompt_tokens)} tokens")
+
+    def resolve_continuation(self, continuation_id: str) -> ContinuationFrontier | None:
+        """Resolve a response identity without reconstructing its transcript."""
+        index = self._continuations.get(continuation_id)
+        if index is not None and index < len(self.prompts):
+            return ContinuationFrontier(
+                self.prompts[index],
+                self._continuation_terminal_tokens[continuation_id],
+            )
+        if self._persistence is None:
+            return None
+        resolver = getattr(self._persistence, "resolve_continuation", None)
+        if resolver is None:
+            return None
+        try:
+            return cast(ContinuationFrontier | None, resolver(continuation_id))
+        except Exception:
+            logger.opt(exception=True).warning(
+                "KV continuation lookup failed; falling back to rendered prompt"
+            )
+            return None
+
+    def is_continuation_entry(self, index: int) -> bool:
+        """Return whether an immutable response identity currently names an entry."""
+        return index in self._continuations.values()
+
+    def _drop_continuations_for_index(self, index: int) -> None:
+        stale = [key for key, value in self._continuations.items() if value == index]
+        for key in stale:
+            del self._continuations[key]
+            self._continuation_terminal_tokens.pop(key, None)
+
+    def _remove_continuation_index(self, index: int) -> None:
+        self._drop_continuations_for_index(index)
+        for key, value in list(self._continuations.items()):
+            if value > index:
+                self._continuations[key] = value - 1
 
     def update_kv_cache(
         self,
@@ -411,6 +533,8 @@ class KVPrefixCache:
         prefill_tps: float = 0.0,
     ):
         """Update an existing cache entry in-place."""
+        if self.is_continuation_entry(index):
+            raise ValueError("response-linked cache frontiers are immutable")
         old_snapshots = self._snapshots[index]
         merged: list[CacheSnapshot] = []
         if old_snapshots:
@@ -455,6 +579,9 @@ class KVPrefixCache:
         model: Model,
         prompt_tokens: mx.array,
         media_regions: list["MediaRegion"] | None = None,
+        *,
+        prefer_persistent_fork: bool = False,
+        prompt_token_bytes: bytes | None = None,
     ) -> tuple[KVCacheType, mx.array, int | None, bool]:
         """Get KV cache for prompt, returning remaining tokens to prefill.
 
@@ -496,6 +623,66 @@ class KVPrefixCache:
             if length > best_length:
                 best_index, best_length = i, length
 
+        if self._persistence is not None and prefer_persistent_fork:
+            if prompt_token_bytes is None:
+                restored = self._persistence.restore_longest(
+                    prompt_tokens,
+                    max(0, best_length - 1),
+                    list(query_regions),
+                )
+            else:
+                restored = self._persistence.restore_longest(
+                    prompt_tokens,
+                    max(0, best_length - 1),
+                    list(query_regions),
+                    prompt_token_bytes=prompt_token_bytes,
+                )
+            if restored is not None:
+                # PersistedKVPrefix is minted only after the backend verifies
+                # this query's token-prefix identity. Repeating that proof on
+                # MLX arrays would synchronize the whole device stream.
+                restored_length = len(restored.prompt_tokens)
+                restored_length = self._validate_media_match(
+                    restored_length,
+                    restored.media_regions,
+                    query_regions,
+                )
+                if restored_length >= best_length:
+                    restored_cache_length = cache_length(restored.cache)
+                    if restored_cache_length <= restored_length:
+                        return (
+                            restored.cache,
+                            prompt_tokens[restored_cache_length:],
+                            None,
+                            restored_cache_length >= max_length - 1,
+                        )
+
+        # A response continuation is an append to an immutable frontier.  If
+        # durable publication is still catching up, fork the local MLX cache
+        # copy-on-write instead of copying every tensor merely to protect the
+        # old response from mutation.  This deliberately supports only cache
+        # layouts whose first multi-token append allocates fresh backing
+        # arrays; unknown layouts retain the conservative deep-copy path.
+        if prefer_persistent_fork and best_index is not None:
+            cached_length = cache_length(self.caches[best_index])
+            fork_position = min(cached_length, best_length)
+            append_count = max_length - fork_position
+            if fork_position > 0:
+                forked = fork_kv_cache_for_append(
+                    self.caches[best_index],
+                    fork_position,
+                    append_count,
+                )
+                if forked is not None:
+                    self._access_counter += 1
+                    self._last_used[best_index] = self._access_counter
+                    return (
+                        forked,
+                        prompt_tokens[fork_position:],
+                        None,
+                        False,
+                    )
+
         if self._persistence is not None and not is_exact:
             restored = self._persistence.restore_longest(
                 prompt_tokens,
@@ -503,9 +690,7 @@ class KVPrefixCache:
                 list(query_regions),
             )
             if restored is not None:
-                restored_length = get_prefix_length(
-                    prompt_tokens, restored.prompt_tokens
-                )
+                restored_length = len(restored.prompt_tokens)
                 restored_length = self._validate_media_match(
                     restored_length,
                     restored.media_regions,
@@ -609,6 +794,7 @@ class KVPrefixCache:
         ):
             lru_index = self._last_used.index(min(self._last_used))
             evicted_tokens = len(self.prompts[lru_index])
+            self._remove_continuation_index(lru_index)
             self.prompts.pop(lru_index)
             self.caches.pop(lru_index)
             self._snapshots.pop(lru_index)
@@ -638,6 +824,46 @@ class KVPrefixCache:
         # .item() evals.
         max_pressure = float(mx.max(all_pressure).item())
         return max_pressure
+
+
+def fork_kv_cache_for_append(
+    cache: KVCacheType,
+    token_count: int,
+    append_count: int,
+) -> list[KVCache | RotatingKVCache] | None:
+    """Fork a plain MLX KV frontier without copying its immutable tensors.
+
+    ``KVCache`` is forced to allocate on its next update by exposing no spare
+    capacity in the fork. ``RotatingKVCache`` allocates on every multi-token
+    update. Thus both may share their old arrays until the first append while
+    the response frontier remains untouched. A one-token append or an unknown
+    cache layout stays on the conservative copying path.
+    """
+    if append_count <= 1 or token_count < 0:
+        return None
+    if any(
+        not isinstance(entry, (KVCache, RotatingKVCache))
+        or isinstance(entry, QuantizedKVCache)
+        for entry in cache
+    ):
+        return None
+
+    forked: list[KVCache | RotatingKVCache] = []
+    for entry in cache:
+        assert isinstance(entry, (KVCache, RotatingKVCache))
+        if entry.offset < token_count or entry.offset - token_count > 1:
+            return None
+        cloned = copy(entry)
+        if isinstance(cloned, RotatingKVCache):
+            cloned.trim(cloned.offset - token_count)
+        else:
+            cloned.offset = token_count
+            if cloned.keys is not None:
+                cloned.keys = cloned.keys[..., :token_count, :]
+            if cloned.values is not None:
+                cloned.values = cloned.values[..., :token_count, :]
+        forked.append(cloned)
+    return forked
 
 
 def trim_cache(

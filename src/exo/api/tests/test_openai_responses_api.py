@@ -14,6 +14,7 @@ import pytest
 from exo.api.adapters.responses import (
     collect_responses_response,
     generate_responses_stream,
+    responses_request_to_text_generation,
 )
 from exo.api.types import CompletionTokensDetails, PromptTokensDetails, Usage
 from exo.api.types.openai_responses import (
@@ -62,6 +63,17 @@ class TestResponsesRequestValidation:
             input=[ResponseInputMessage(role="user", content="Hello")],
         )
         assert len(request.input) == 1
+
+    async def test_previous_response_id_reaches_internal_task(self):
+        request = ResponsesRequest(
+            model=ModelId("gpt-4o"),
+            input="continue",
+            previous_response_id="resp-prior",
+        )
+
+        task = await responses_request_to_text_generation(request)
+
+        assert task.previous_response_id == "resp-prior"
 
 
 class TestResponseUsage:

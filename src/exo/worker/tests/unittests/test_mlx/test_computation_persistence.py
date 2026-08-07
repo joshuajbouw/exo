@@ -23,6 +23,7 @@ class _FakeComputationStore:
     put_started: Event | None = None
     release_put: Event | None = None
     get_file_calls = 0
+    digest_file_calls = 0
 
     def __init__(self, path: Path):
         self.path = str(path)
@@ -49,6 +50,7 @@ class _FakeComputationStore:
         return digest, f"sha256:{digest}"
 
     def digest_file(self, source: Path) -> str:
+        _FakeComputationStore.digest_file_calls += 1
         return f"sha256:{hashlib.sha256(source.read_bytes()).hexdigest()}"
 
     def get(self, key: str) -> bytes | None:
@@ -71,6 +73,7 @@ def _reset_fake_store() -> None:
     _FakeComputationStore.put_started = None
     _FakeComputationStore.release_put = None
     _FakeComputationStore.get_file_calls = 0
+    _FakeComputationStore.digest_file_calls = 0
 
 
 def test_prefix_identity_binds_profile_length_and_tokens():
@@ -112,6 +115,57 @@ def test_checkpoint_round_trips_through_storage(tmp_path: Path):
     assert mx.array_equal(restored.prompt_tokens, prompt)
     assert _FakeComputationStore.get_file_calls == 0
 
+    persistence.close()
+
+
+def test_continuation_alias_round_trips_exact_frontier(tmp_path: Path):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys + 1)
+    mx.eval(cache.state)
+
+    persistence._store_checkpoint(
+        prompt,
+        [cache],
+        1.0,
+        continuation_id="resp-a",
+    )
+
+    resolved = persistence.resolve_continuation("resp-a")
+    assert resolved is not None
+    assert mx.array_equal(resolved.tokens, prompt)
+    assert resolved.terminal_token == 4
+    assert persistence.resolve_continuation("resp-unknown") is None
+    persistence.close()
+
+
+def test_tampered_continuation_alias_fails_closed(tmp_path: Path):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys)
+    mx.eval(cache.state)
+    persistence._store_checkpoint(
+        prompt,
+        [cache],
+        1.0,
+        continuation_id="resp-a",
+    )
+    key = next(
+        key
+        for path, key in _FakeComputationStore.values
+        if key.startswith("continuation/v1/")
+    )
+    _FakeComputationStore.values[(str(tmp_path / "store"), key)] = b"not-json"
+
+    assert persistence.resolve_continuation("resp-a") is None
     persistence.close()
 
 
@@ -178,6 +232,27 @@ def test_projection_survives_persistence_reopen(tmp_path: Path):
     assert restored is not None
     assert _FakeComputationStore.get_file_calls == 0
     assert reopened.last_restore_metrics.projection_verification_seconds >= 0
+    reopened.close()
+
+
+def test_unchanged_projection_is_hashed_once_per_process(tmp_path: Path):
+    _install_fake_store()
+    _reset_fake_store()
+    store_path = tmp_path / "store"
+    prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys)
+    mx.eval(cache.state)
+    writer = StoreKVPrefixPersistence(store_path, "profile-a")
+    writer._store_checkpoint(prompt, [cache], 1.0)
+    writer.close()
+
+    reopened = StoreKVPrefixPersistence(store_path, "profile-a")
+    assert reopened.restore_longest(prompt, 0, []) is not None
+    assert reopened.restore_longest(prompt, 0, []) is not None
+
+    assert _FakeComputationStore.digest_file_calls == 1
     reopened.close()
 
 
@@ -273,5 +348,48 @@ def test_pending_publication_coalesces_to_latest_frontier(tmp_path: Path):
     persistence.close()
 
     assert persistence._read_lengths() == [4, 6]
+    _FakeComputationStore.put_started = None
+    _FakeComputationStore.release_put = None
+
+
+def test_pending_publication_never_coalesces_different_continuations(
+    tmp_path: Path,
+):
+    _install_fake_store()
+    _reset_fake_store()
+    _FakeComputationStore.put_started = Event()
+    _FakeComputationStore.release_put = Event()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys)
+    mx.eval(cache.state)
+    first = mx.array([1, 2, 3, 4])
+    second = mx.array([5, 6, 7, 8])
+
+    persistence.schedule_store_thread_bound(
+        first,
+        [cache],
+        None,
+        [],
+        1.0,
+        continuation_id="resp-a",
+    )
+    assert _FakeComputationStore.put_started.wait(timeout=5)
+    persistence.schedule_store_thread_bound(
+        second,
+        [cache],
+        None,
+        [],
+        1.0,
+        continuation_id="resp-b",
+    )
+    _FakeComputationStore.release_put.set()
+    persistence.close()
+
+    resolved_a = persistence.resolve_continuation("resp-a")
+    resolved_b = persistence.resolve_continuation("resp-b")
+    assert resolved_a is not None and mx.array_equal(resolved_a.tokens, first)
+    assert resolved_b is not None and mx.array_equal(resolved_b.tokens, second)
     _FakeComputationStore.put_started = None
     _FakeComputationStore.release_put = None

@@ -326,6 +326,7 @@ class ResponsesRequest(BaseModel, frozen=True):
     tools: list[dict[str, Any]] | None = None
     metadata: dict[str, str] | None = None
     reasoning: Reasoning | None = None
+    previous_response_id: str | None = None
 
     # --- exo extensions (not in OpenAI Responses API spec) ---
     enable_thinking: bool | None = Field(

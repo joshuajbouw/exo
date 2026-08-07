@@ -6,9 +6,11 @@ import hashlib
 import os
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from stat import S_ISREG
 from threading import Condition, Lock, Thread
 from typing import TYPE_CHECKING, cast
 
@@ -19,7 +21,7 @@ from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
 
 from exo.worker.engines.mlx.cache import cache_length
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
-from exo.worker.engines.mlx.types import KVCacheType
+from exo.worker.engines.mlx.types import ContinuationFrontier, KVCacheType
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -36,6 +38,7 @@ class _LazyCheckpoint:
     prompt_tokens: mx.array
     cache: KVCacheType
     prefill_tps: float
+    continuation_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,9 +49,12 @@ class _PreparedCheckpoint:
     cache_tokens: int
     prefill_tps: float
     serialization_seconds: float
+    continuation_id: str | None
+    prompt_tokens: bytes
 
 
 type _PendingCheckpoint = _LazyCheckpoint | _PreparedCheckpoint
+type _ProjectionFingerprint = tuple[int, int, int, int, int]
 
 
 class _CheckpointMetadata(msgspec.Struct, frozen=True):
@@ -60,6 +66,15 @@ class _CheckpointMetadata(msgspec.Struct, frozen=True):
     token_count: int
     cache_tokens: int
     prefill_tps: float
+
+
+class _ContinuationMetadata(msgspec.Struct, frozen=True):
+    schema: int
+    runtime_profile: str
+    continuation_id: str
+    prefix_id: str
+    token_count: int
+    prompt_tokens: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +115,10 @@ class StoreKVPrefixPersistence:
         self._runtime_profile = runtime_profile
         self._profile_id = _digest(runtime_profile.encode())
         self._index_lock = Lock()
+        self._projection_lock = Lock()
+        self._verified_projections: dict[Path, tuple[_ProjectionFingerprint, str]] = {}
         self._publication = Condition()
-        self._pending: _PendingCheckpoint | None = None
+        self._pending: deque[_PendingCheckpoint] = deque()
         self._closing = False
         self._projections = store_path / "projections"
         self._projections.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -119,6 +136,7 @@ class StoreKVPrefixPersistence:
         prompt_tokens: mx.array,
         minimum_tokens: int,
         media_regions: list["MediaRegion"],
+        prompt_token_bytes: bytes | None = None,
     ) -> PersistedKVPrefix | None:
         self.last_restore_metrics = RestoreMetrics()
         if media_regions:
@@ -128,9 +146,17 @@ class StoreKVPrefixPersistence:
             for token_count in reversed(lengths):
                 if token_count <= minimum_tokens or token_count > len(prompt_tokens):
                     continue
-                prefix_id = _prefix_id(
-                    self._runtime_profile,
-                    prompt_tokens[:token_count],
+                prefix_id = (
+                    _prefix_id_from_bytes(
+                        self._runtime_profile,
+                        token_count,
+                        prompt_token_bytes[: token_count * 4],
+                    )
+                    if prompt_token_bytes is not None
+                    else _prefix_id(
+                        self._runtime_profile,
+                        prompt_tokens[:token_count],
+                    )
                 )
                 metadata = self._read_metadata(prefix_id)
                 if metadata is None or metadata.token_count != token_count:
@@ -139,11 +165,24 @@ class StoreKVPrefixPersistence:
                 verification_seconds = 0.0
                 reconstruction_seconds = 0.0
                 if self._projection_available(projection):
-                    started = time.perf_counter()
-                    projection_digest = self._store.digest_file(projection)
-                    verification_seconds = time.perf_counter() - started
+                    projection_digest = self._cached_projection_digest(projection)
+                    if projection_digest is None:
+                        started = time.perf_counter()
+                        before = self._projection_fingerprint(projection)
+                        projection_digest = self._store.digest_file(projection)
+                        after = self._projection_fingerprint(projection)
+                        verification_seconds = time.perf_counter() - started
+                        if before is None or before != after:
+                            projection_digest = "changed-during-verification"
+                        else:
+                            self._remember_verified_projection(
+                                projection,
+                                projection_digest,
+                                after,
+                            )
                     if projection_digest != metadata.projection_digest:
                         projection.unlink(missing_ok=True)
+                        self._forget_verified_projection(projection)
                 if not self._projection_available(projection):
                     destination = self._temporary_path("restore", prefix_id)
                     started = time.perf_counter()
@@ -161,6 +200,10 @@ class StoreKVPrefixPersistence:
                                 "checkpoint representation digest mismatch"
                             )
                         os.replace(destination, projection)
+                        self._remember_verified_projection(
+                            projection,
+                            projection_digest,
+                        )
                     finally:
                         destination.unlink(missing_ok=True)
                     reconstruction_seconds = time.perf_counter() - started
@@ -193,6 +236,48 @@ class StoreKVPrefixPersistence:
             )
         return None
 
+    def resolve_continuation(self, continuation_id: str) -> ContinuationFrontier | None:
+        """Resolve a response id to a verified append-only token frontier."""
+        if not continuation_id:
+            return None
+        try:
+            encoded = self._store.get(
+                _continuation_key(self._profile_id, continuation_id)
+            )
+            if encoded is None:
+                return None
+            metadata = msgspec.json.decode(bytes(encoded), type=_ContinuationMetadata)
+            if (
+                metadata.schema != _SCHEMA
+                or metadata.runtime_profile != self._profile_id
+                or metadata.continuation_id != continuation_id
+                or metadata.token_count < 0
+                or len(metadata.prompt_tokens) != metadata.token_count * 4
+            ):
+                raise ValueError("continuation metadata mismatch")
+            token_values = np.frombuffer(metadata.prompt_tokens, dtype="<u4").copy()
+            tokens = mx.array(token_values, dtype=mx.uint32)
+            if (
+                _prefix_id_from_bytes(
+                    self._runtime_profile,
+                    metadata.token_count,
+                    metadata.prompt_tokens,
+                )
+                != metadata.prefix_id
+            ):
+                raise ValueError("continuation token identity mismatch")
+            terminal_token = int(cast(np.uint32, token_values[-1]))
+            return ContinuationFrontier(
+                tokens,
+                terminal_token,
+                metadata.prompt_tokens,
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "KV continuation metadata failed verification; treating it as a miss"
+            )
+            return None
+
     def schedule_store(
         self,
         prompt_tokens: mx.array,
@@ -200,6 +285,7 @@ class StoreKVPrefixPersistence:
         snapshots: list["CacheSnapshot"] | None,
         media_regions: list["MediaRegion"],
         prefill_tps: float,
+        continuation_id: str | None = None,
     ) -> None:
         # Media identity is not part of MLX's portable prompt-cache format.
         # SSM/rotating rollback snapshots need not persist: the serialized
@@ -213,7 +299,14 @@ class StoreKVPrefixPersistence:
             # Retain at most one waiting checkpoint. If generation advances
             # faster than storage, the newest frontier replaces stale queued
             # work instead of pinning every historical cache in RAM.
-            self._replace_pending(_LazyCheckpoint(prompt_tokens, cache, prefill_tps))
+            self._enqueue_checkpoint(
+                _LazyCheckpoint(
+                    prompt_tokens,
+                    cache,
+                    prefill_tps,
+                    continuation_id,
+                )
+            )
             self._publication.notify()
 
     def schedule_store_thread_bound(
@@ -223,22 +316,35 @@ class StoreKVPrefixPersistence:
         snapshots: list["CacheSnapshot"] | None,
         media_regions: list["MediaRegion"],
         prefill_tps: float,
+        continuation_id: str | None = None,
     ) -> None:
         """Capture generation-stream state before crossing a thread boundary."""
         if media_regions:
             return
-        prepared = self._prepare_checkpoint(prompt_tokens, cache, prefill_tps)
+        prepared = self._prepare_checkpoint(
+            prompt_tokens,
+            cache,
+            prefill_tps,
+            continuation_id,
+        )
         with self._publication:
             if self._closing:
                 prepared.source.unlink(missing_ok=True)
                 return
-            self._replace_pending(prepared)
+            self._enqueue_checkpoint(prepared)
             self._publication.notify()
 
-    def _replace_pending(self, checkpoint: _PendingCheckpoint) -> None:
-        if isinstance(self._pending, _PreparedCheckpoint):
-            self._pending.source.unlink(missing_ok=True)
-        self._pending = checkpoint
+    def _enqueue_checkpoint(self, checkpoint: _PendingCheckpoint) -> None:
+        """Coalesce one lineage without dropping another response's frontier."""
+        continuation_id = checkpoint.continuation_id
+        for index in range(len(self._pending) - 1, -1, -1):
+            queued = self._pending[index]
+            if queued.continuation_id == continuation_id:
+                if isinstance(queued, _PreparedCheckpoint):
+                    queued.source.unlink(missing_ok=True)
+                self._pending[index] = checkpoint
+                return
+        self._pending.append(checkpoint)
 
     def close(self) -> None:
         with self._publication:
@@ -249,12 +355,11 @@ class StoreKVPrefixPersistence:
     def _publication_loop(self) -> None:
         while True:
             with self._publication:
-                while self._pending is None and not self._closing:
+                while not self._pending and not self._closing:
                     self._publication.wait()
-                if self._pending is None:
+                if not self._pending:
                     return
-                checkpoint = self._pending
-                self._pending = None
+                checkpoint = self._pending.popleft()
             try:
                 if isinstance(checkpoint, _PreparedCheckpoint):
                     self._publish_checkpoint(checkpoint)
@@ -263,6 +368,7 @@ class StoreKVPrefixPersistence:
                         checkpoint.prompt_tokens,
                         checkpoint.cache,
                         checkpoint.prefill_tps,
+                        checkpoint.continuation_id,
                     )
             except Exception:
                 logger.opt(exception=True).warning(
@@ -274,9 +380,15 @@ class StoreKVPrefixPersistence:
         prompt_tokens: mx.array,
         cache: KVCacheType,
         prefill_tps: float,
+        continuation_id: str | None = None,
     ) -> None:
         self._publish_checkpoint(
-            self._prepare_checkpoint(prompt_tokens, cache, prefill_tps)
+            self._prepare_checkpoint(
+                prompt_tokens,
+                cache,
+                prefill_tps,
+                continuation_id,
+            )
         )
 
     def _prepare_checkpoint(
@@ -284,6 +396,7 @@ class StoreKVPrefixPersistence:
         prompt_tokens: mx.array,
         cache: KVCacheType,
         prefill_tps: float,
+        continuation_id: str | None = None,
     ) -> _PreparedCheckpoint:
         token_count = len(prompt_tokens)
         prefix_id = _prefix_id(self._runtime_profile, prompt_tokens)
@@ -306,6 +419,8 @@ class StoreKVPrefixPersistence:
                 cache_tokens=cache_length(cache),
                 prefill_tps=prefill_tps,
                 serialization_seconds=time.perf_counter() - started,
+                continuation_id=continuation_id,
+                prompt_tokens=np.asarray(prompt_tokens, dtype="<u4").tobytes(order="C"),
             )
         except Exception:
             source.unlink(missing_ok=True)
@@ -319,6 +434,10 @@ class StoreKVPrefixPersistence:
                 _content_name(self._profile_id, checkpoint.prefix_id), source
             )
             os.replace(source, self._projection_path(content_object))
+            self._remember_verified_projection(
+                self._projection_path(content_object),
+                projection_digest,
+            )
         finally:
             source.unlink(missing_ok=True)
         admission_seconds = time.perf_counter() - started
@@ -346,6 +465,22 @@ class StoreKVPrefixPersistence:
                     _index_key(self._profile_id),
                     msgspec.json.encode(lengths),
                 )
+        if checkpoint.continuation_id is not None:
+            continuation = _ContinuationMetadata(
+                schema=_SCHEMA,
+                runtime_profile=self._profile_id,
+                continuation_id=checkpoint.continuation_id,
+                prefix_id=checkpoint.prefix_id,
+                token_count=checkpoint.token_count,
+                prompt_tokens=checkpoint.prompt_tokens,
+            )
+            self._store.set(
+                _continuation_key(
+                    self._profile_id,
+                    checkpoint.continuation_id,
+                ),
+                msgspec.json.encode(continuation),
+            )
         self.last_publication_metrics = PublicationMetrics(
             mlx_serialization_seconds=checkpoint.serialization_seconds,
             store_admission_seconds=admission_seconds,
@@ -387,6 +522,50 @@ class StoreKVPrefixPersistence:
             projection.unlink(missing_ok=True)
             return False
         return projection.is_file()
+
+    @staticmethod
+    def _projection_fingerprint(
+        projection: Path,
+    ) -> _ProjectionFingerprint | None:
+        try:
+            value = projection.lstat()
+        except FileNotFoundError:
+            return None
+        if not S_ISREG(value.st_mode):
+            return None
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    def _cached_projection_digest(self, projection: Path) -> str | None:
+        fingerprint = self._projection_fingerprint(projection)
+        if fingerprint is None:
+            return None
+        with self._projection_lock:
+            cached = self._verified_projections.get(projection)
+        if cached is None or cached[0] != fingerprint:
+            return None
+        return cached[1]
+
+    def _remember_verified_projection(
+        self,
+        projection: Path,
+        digest: str,
+        fingerprint: _ProjectionFingerprint | None = None,
+    ) -> None:
+        fingerprint = fingerprint or self._projection_fingerprint(projection)
+        if fingerprint is None:
+            return
+        with self._projection_lock:
+            self._verified_projections[projection] = (fingerprint, digest)
+
+    def _forget_verified_projection(self, projection: Path) -> None:
+        with self._projection_lock:
+            self._verified_projections.pop(projection, None)
 
     def _temporary_path(self, operation: str, prefix_id: str) -> Path:
         descriptor, value = tempfile.mkstemp(
@@ -460,12 +639,22 @@ def _package_version(name: str) -> str:
 
 def _prefix_id(runtime_profile: str, tokens: mx.array) -> str:
     token_bytes = np.asarray(tokens, dtype="<u4").tobytes(order="C")
+    return _prefix_id_from_bytes(runtime_profile, len(tokens), token_bytes)
+
+
+def _prefix_id_from_bytes(
+    runtime_profile: str,
+    token_count: int,
+    token_bytes: bytes,
+) -> str:
+    if len(token_bytes) != token_count * 4:
+        raise ValueError("token byte length mismatch")
     profile = runtime_profile.encode()
     hasher = hashlib.sha256()
     hasher.update(_PREFIX_DOMAIN)
     hasher.update(len(profile).to_bytes(8, "little"))
     hasher.update(profile)
-    hasher.update(len(tokens).to_bytes(8, "little"))
+    hasher.update(token_count.to_bytes(8, "little"))
     hasher.update(token_bytes)
     return hasher.hexdigest()
 
@@ -503,3 +692,7 @@ def _metadata_key(profile_id: str, prefix_id: str) -> str:
 
 def _index_key(profile_id: str) -> str:
     return f"prefix-index/v1/{profile_id}"
+
+
+def _continuation_key(profile_id: str, continuation_id: str) -> str:
+    return f"continuation/v1/{profile_id}/{_digest(continuation_id.encode())}"

@@ -390,6 +390,7 @@ async def responses_request_to_text_generation(
         chat_template_messages=built_chat_template or request.chat_template_messages,
         reasoning_effort=resolved_effort,
         enable_thinking=resolved_thinking,
+        previous_response_id=request.previous_response_id,
         images=images,
     )
 
