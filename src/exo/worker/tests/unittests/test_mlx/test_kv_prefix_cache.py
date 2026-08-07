@@ -20,6 +20,7 @@ from exo.worker.engines.mlx.cache import (
     fork_kv_cache_for_append,
     get_prefix_length,
     make_kv_cache,
+    retain_forked_kv_cache_prefix,
 )
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
 from exo.worker.engines.mlx.draft_selection import (
@@ -343,6 +344,21 @@ def test_matching_draft_prefix_is_salvaged_before_mismatch_falls_back():
     assert outcome.first_mismatch == 2
     assert outcome.verification_passes == 1
     assert outcome.verification_duration_ns > 0
+
+
+def test_partial_draft_removes_rejected_tail_from_full_rotating_cache():
+    cache = RotatingKVCache(max_size=4, keep=1)
+    initial = mx.array([[[[0.0], [1.0], [2.0], [3.0]]]])
+    cache.update_and_fetch(initial, initial)
+    appended = mx.array([[[[4.0], [5.0], [6.0], [7.0]]]])
+    cache.update_and_fetch(appended, appended)
+
+    assert cache.keys.shape[2] == 7
+    assert retain_forked_kv_cache_prefix([cache], 4, 2)
+    assert cache.offset == 6
+    assert cache._idx == 5
+    assert cache.keys[0, 0, :, 0].tolist() == [0.0, 2.0, 3.0, 4.0, 5.0]
+    assert cache.values[0, 0, :, 0].tolist() == [0.0, 2.0, 3.0, 4.0, 5.0]
 
 
 def test_ranked_candidate_falls_through_after_zero_length_block_match():

@@ -933,6 +933,52 @@ def fork_kv_cache_for_append(
     return forked
 
 
+def retain_forked_kv_cache_prefix(
+    cache: list[KVCache | RotatingKVCache],
+    appended_token_count: int,
+    retained_token_count: int,
+) -> bool:
+    """Discard an unaccepted suffix from a multi-token cache append.
+
+    ``RotatingKVCache.trim`` only adjusts cursors. Once its sliding window is
+    full, the multi-token append path stores the appended tensors contiguously
+    at the tail, and cursor-only trimming leaves rejected tokens physically
+    visible to the next model call. Slice that tail explicitly. Plain
+    ``KVCache`` remains safely trimmable through its public operation.
+    """
+    if not 0 <= retained_token_count <= appended_token_count:
+        return False
+    discarded_token_count = appended_token_count - retained_token_count
+    if discarded_token_count == 0:
+        return True
+
+    for entry in cache:
+        if isinstance(entry, RotatingKVCache):
+            if (
+                entry.keys is None
+                or entry.values is None
+                or entry.keys.shape[2] < discarded_token_count
+                or entry.values.shape[2] < discarded_token_count
+                or entry.offset < discarded_token_count
+                or entry._idx < discarded_token_count
+            ):
+                return False
+        elif entry.offset < discarded_token_count:
+            return False
+
+    for entry in cache:
+        if isinstance(entry, RotatingKVCache):
+            assert entry.keys is not None and entry.values is not None
+            retained_length = entry.keys.shape[2] - discarded_token_count
+            entry.keys = entry.keys[..., :retained_length, :]
+            entry.values = entry.values[..., :retained_length, :]
+            entry.offset -= discarded_token_count
+            entry._idx -= discarded_token_count
+        else:
+            assert entry.trim(discarded_token_count) == discarded_token_count
+    return True
+
+
 def trim_cache(
     cache: KVCacheType,
     num_tokens: int,

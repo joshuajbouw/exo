@@ -161,22 +161,39 @@ durable fleet memory. Corpus identity binds the privacy domain, runtime profile,
 selector profile, source identities, contexts, and candidate tokens.
 
 Dynamic re-selection after ordinary progress is deliberately experimental and
-disabled by default. The real-trace gate found a serial-equivalence failure: on
-a held-out Astrid tool window, 32-token verification accepted 62 speculative
-tokens but diverged from serial greedy output at token 6 and slowed 22.999 tok/s
-to 12.696 tok/s. A 64-token matrix also diverged at block sizes 16, 8, and 4.
-The likely boundary is the adopted KV state from batched causal attention:
-candidate tokens are verified, but its floating-point cache state need not be
-bit-identical to serial cache construction. This is a failed gate, not a speed
-claim. The selector and telemetry are retained for research; runtime wiring
-must not enable dynamic refill until serial-equivalence is either proved for a
-runtime profile or the API explicitly adopts weaker numerical semantics.
+disabled by default. Its first real-trace gate exposed a concrete rollback bug:
+once Gemma's sliding window was full, MLX's `RotatingKVCache.trim()` advanced
+its cursors but left rejected tail tensors visible. The short synthetic fixture
+never crossed the window and therefore missed it. Exo now removes the physical
+tail and has a full-window regression. Re-running the same held-out Astrid tool
+window at a 16-token block produced the same 64 tokens as serial greedy,
+accepted 24 speculative tokens, and ran at 18.87 tok/s versus 21.27 tok/s
+(0.89x). The output gate recovered; this selector/corpus pair is not yet an
+optimization.
+
+An independent serial-versus-batched diagnostic also established a separate
+MLX constraint. Fully copied and copy-on-write caches produce the same batched
+result, ruling out Exo's fork, but MLX's multi-token causal kernel is not
+bit-identical to repeated one-token execution. On the 1,423-token held-out
+window, accepted full blocks retained the same argmax while maximum logit
+differences grew from 2.57 at four tokens to 14.20 at 32. Before the rollback
+fix, the two affected partial prefixes flipped the next argmax; after it, both
+matched serial again. Dynamic refill remains disabled until a broader
+equivalence matrix and a useful hit-rate/performance gate pass. Memo presence
+must not silently choose weaker generation semantics.
 
 Reproduce that gate against an extracted trace with:
 
 ```bash
 uv run bench/speculative_continuation.py /path/to/mlx-model \
   --tokens 128 --block-size 32 --tensor-logic \
+  --trace-file /path/to/held-out-session.txt --trace-cut 507334
+```
+
+Diagnose the MLX kernel and partial-cache boundary directly with:
+
+```bash
+uv run bench/mlx_kv_equivalence.py /path/to/mlx-model \
   --trace-file /path/to/held-out-session.txt --trace-cut 507334
 ```
 

@@ -9,7 +9,11 @@ from mlx_lm.models.cache import (
     TokenBuffer,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]
 )
 
-from exo.worker.engines.mlx.cache import cache_length, fork_kv_cache_for_append
+from exo.worker.engines.mlx.cache import (
+    cache_length,
+    fork_kv_cache_for_append,
+    retain_forked_kv_cache_prefix,
+)
 from exo.worker.engines.mlx.draft_selection import (
     DraftCandidate,
     DraftSelection,
@@ -379,11 +383,13 @@ def _verify_next_draft_block(batch: GenerationBatch, inputs: mx.array) -> bool:
         _finish_candidate(batch, candidate, cursor, cursor)
         return False
 
-    if accepted_count < block_size:
-        trim_count = block_size - accepted_count
-        if any(entry.trim(trim_count) != trim_count for entry in forked):
-            _finish_candidate(batch, candidate, cursor, cursor + accepted_count)
-            return False
+    if accepted_count < block_size and not retain_forked_kv_cache_prefix(
+        forked,
+        block_size,
+        accepted_count,
+    ):
+        _finish_candidate(batch, candidate, cursor, cursor + accepted_count)
+        return False
 
     batch._speculative_base_cache = base_cache  # pyright: ignore[reportAttributeAccessIssue]
     batch._speculative_replay_tokens = [current]  # pyright: ignore[reportAttributeAccessIssue]
