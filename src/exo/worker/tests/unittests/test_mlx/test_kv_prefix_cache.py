@@ -1,5 +1,6 @@
 # type: ignore
 import time
+from collections import deque
 from typing import cast
 from unittest.mock import patch
 
@@ -21,6 +22,7 @@ from exo.worker.engines.mlx.cache import (
     make_kv_cache,
 )
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
+from exo.worker.engines.mlx.generator.batch_generate import _draft_tokens_are_valid
 from exo.worker.engines.mlx.generator.generate import (
     append_only_continuation_tokens,
     mlx_generate,
@@ -31,7 +33,7 @@ from exo.worker.engines.mlx.patches.opt_batch_gen import (
     _patched_step,
     prepare_for_batch_extension,
 )
-from exo.worker.engines.mlx.types import ContinuationFrontier, Model
+from exo.worker.engines.mlx.types import ContinuationFrontier, DraftContinuation, Model
 from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 from exo.worker.tests.unittests.test_mlx.conftest import (
     DEFAULT_GPT_OSS_CONFIG,
@@ -89,7 +91,6 @@ def test_append_only_continuation_rejects_ambiguous_request_shape():
         input=[InputMessage(role="user", content="new turn")],
         instructions="changed system policy",
     )
-
     assert (
         append_only_continuation_tokens(
             tokenizer,  # type: ignore[arg-type]
@@ -99,6 +100,13 @@ def test_append_only_continuation_rejects_ambiguous_request_shape():
         )
         is None
     )
+
+
+def test_speculative_draft_rejects_out_of_vocabulary_tokens():
+    assert _draft_tokens_are_valid(DraftContinuation((0, 7, 15)), 16)
+    assert not _draft_tokens_are_valid(DraftContinuation((0, 16)), 16)
+    assert not _draft_tokens_are_valid(DraftContinuation((-1, 2)), 16)
+    assert not _draft_tokens_are_valid(DraftContinuation((1, 2)), None)
 
 
 def test_singleton_generation_cache_transfers_without_extraction_copy():
@@ -187,6 +195,23 @@ def test_pending_primed_batch_reverts_before_a_concurrent_insert():
     assert batch._primed_response_pending
 
 
+def test_completed_direct_batch_clears_before_next_insert():
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch._direct_generation = True
+    batch._primed_response_pending = False
+    batch._speculative_queue = deque([(3, mx.zeros(4))])
+    batch._speculative_base_cache = []
+    batch._speculative_replay_tokens = [2]
+    batch.uids = []
+
+    prepare_for_batch_extension(batch)
+
+    assert not batch._direct_generation
+    assert batch._speculative_draft is None
+    assert not batch._speculative_queue
+    assert batch._speculative_base_cache is None
+
+
 def test_returned_primed_batch_advances_before_a_concurrent_insert():
     class NextTokenModel:
         def __call__(self, tokens, cache):
@@ -210,6 +235,93 @@ def test_returned_primed_batch_advances_before_a_concurrent_insert():
     assert not batch._direct_generation
     assert batch._next_tokens.tolist() == [3]
     assert batch.tokens == [[1, 2]]
+
+
+class _IncrementingCacheModel:
+    def __init__(self, vocab_size: int = 16):
+        self.vocab_size = vocab_size
+        self.calls: list[list[int]] = []
+
+    def __call__(self, tokens, cache):
+        token_values = cast(list[int], tokens[0].tolist())
+        self.calls.append(token_values)
+        steps = len(token_values)
+        state = mx.zeros((1, 1, steps, 1))
+        cache[0].update_and_fetch(state, state)
+        rows = []
+        for token in token_values:
+            row = [-100.0] * self.vocab_size
+            row[token + 1] = 100.0
+            rows.append(row)
+        return mx.array([rows])
+
+
+def _speculative_batch(draft: tuple[int, ...]):
+    cache = KVCache()
+    state = mx.zeros((1, 1, 3, 1))
+    cache.update_and_fetch(state, state)
+    batch = GenerationBatch.__new__(GenerationBatch)
+    batch._direct_generation = True
+    batch._primed_response_pending = True
+    batch._next_tokens = mx.array([draft[0]])
+    batch._next_logprobs = mx.zeros((1, 16))
+    batch._speculative_draft = draft
+    batch._speculative_cursor = 0
+    batch._speculative_queue = deque()
+    batch._speculative_base_cache = None
+    batch._speculative_replay_tokens = []
+    batch._speculative_accepted = 0
+    batch.tokens = [[1]]
+    batch.prompt_cache = [cache]
+    batch.model = _IncrementingCacheModel()
+    batch.samplers = [None]
+    batch.fallback_sampler = lambda scores: mx.argmax(scores, axis=-1)
+    batch.uids = [7]
+    batch.max_tokens = [16]
+    batch._num_tokens = [0]
+    return batch, cache
+
+
+def test_greedy_draft_is_verified_in_one_block_without_mutating_base_cache():
+    batch, base_cache = _speculative_batch((2, 3, 4, 5))
+
+    assert _patched_step(batch)[0] == [2]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [3]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [4]
+
+    assert batch.model.calls == [[2, 3, 4]]
+    assert batch._speculative_accepted == 3
+    assert base_cache.offset == 3
+    assert cache_length(batch.prompt_cache) == 6
+
+
+def test_mismatched_draft_is_discarded_before_any_token_is_returned():
+    batch, _ = _speculative_batch((2, 3, 9, 10))
+
+    assert _patched_step(batch)[0] == [2]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [3]
+
+    assert batch._speculative_draft is None
+    assert batch._speculative_accepted == 0
+    assert batch.model.calls == [[2, 3, 9], [2]]
+
+
+def test_verified_ahead_cache_rebases_before_concurrent_insert():
+    batch, base_cache = _speculative_batch((2, 3, 4, 5))
+
+    assert _patched_step(batch)[0] == [2]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [3]
+    batch._num_tokens[0] += 1
+    prepare_for_batch_extension(batch)
+
+    assert not batch._direct_generation
+    assert batch._next_tokens.tolist() == [4]
+    assert cache_length(batch.prompt_cache) == 5
+    assert base_cache.offset == 3
 
 
 def test_continuation_replays_token_trailing_a_lagged_cache():

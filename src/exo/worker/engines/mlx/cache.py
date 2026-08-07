@@ -1,6 +1,7 @@
 import gc
+import hashlib
 import os
-from collections import deque
+from collections import OrderedDict, deque
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, cast
 
@@ -24,7 +25,12 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.memory import Memory
 from exo.worker.engines.mlx.constants import CACHE_GROUP_SIZE, KV_CACHE_BITS
-from exo.worker.engines.mlx.types import ContinuationFrontier, KVCacheType, Model
+from exo.worker.engines.mlx.types import (
+    ContinuationFrontier,
+    DraftContinuation,
+    KVCacheType,
+    Model,
+)
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -245,6 +251,9 @@ class KVPrefixCache:
         self.prefill_tps: list[float] = []
         self._continuations: dict[str, int] = {}
         self._continuation_terminal_tokens: dict[str, int] = {}
+        # Draft metadata is bounded by the number of retained KV frontiers;
+        # it cannot become a second unaccounted conversation history.
+        self._drafts: OrderedDict[bytes, DraftContinuation] = OrderedDict()
         self._deferred_thread_bound: deque[
             tuple[
                 mx.array,
@@ -354,6 +363,7 @@ class KVPrefixCache:
         self.prefill_tps.clear()
         self._continuations.clear()
         self._continuation_terminal_tokens.clear()
+        self._drafts.clear()
         self._deferred_thread_bound.clear()
 
     def close(self) -> None:
@@ -505,6 +515,63 @@ class KVPrefixCache:
                 "KV continuation lookup failed; falling back to rendered prompt"
             )
             return None
+
+    def remember_draft(
+        self,
+        prompt_tokens: mx.array,
+        output_tokens: list[int],
+    ) -> None:
+        """Remember one exact-prompt continuation as an untrusted draft.
+
+        A draft is only a proposal. The target model must verify it before any
+        token is returned, so persistence failure or stale data can affect
+        performance but never generation correctness.
+        """
+        if not output_tokens:
+            return
+        draft = DraftContinuation(tuple(output_tokens))
+        self._retain_draft(_draft_prompt_key(prompt_tokens), draft)
+        if self._persistence is None:
+            return
+        schedule = getattr(self._persistence, "schedule_draft", None)
+        if schedule is None:
+            return
+        try:
+            schedule(prompt_tokens, output_tokens)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Speculative draft persistence failed; generation remains valid"
+            )
+
+    def resolve_draft(self, prompt_tokens: mx.array) -> DraftContinuation | None:
+        """Return a candidate for verification, never an authoritative result."""
+        key = _draft_prompt_key(prompt_tokens)
+        local = self._drafts.get(key)
+        if local is not None:
+            self._drafts.move_to_end(key)
+            return local
+        if self._persistence is None:
+            return None
+        resolve = getattr(self._persistence, "resolve_draft", None)
+        if resolve is None:
+            return None
+        try:
+            restored = cast(DraftContinuation | None, resolve(prompt_tokens))
+            if restored is not None:
+                self._retain_draft(key, restored)
+            return restored
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Speculative draft lookup failed; using ordinary generation"
+            )
+            return None
+
+    def _retain_draft(self, key: bytes, draft: DraftContinuation) -> None:
+        self._drafts[key] = draft
+        self._drafts.move_to_end(key)
+        limit = max(1, len(self.prompts))
+        while len(self._drafts) > limit:
+            self._drafts.popitem(last=False)
 
     def is_continuation_entry(self, index: int) -> bool:
         """Return whether an immutable response identity currently names an entry."""
@@ -907,6 +974,15 @@ def encode_prompt(tokenizer: TokenizerWrapper, prompt: str) -> mx.array:
     # Chat templates define their own structure - don't add BOS/EOS
     prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
     return mx.array(prompt_tokens)
+
+
+def _draft_prompt_key(tokens: mx.array) -> bytes:
+    encoded = np.asarray(tokens, dtype="<u4").tobytes(order="C")
+    digest = hashlib.sha256()
+    digest.update(b"exo-mlx-draft-prompt-v1\0")
+    digest.update(len(encoded).to_bytes(8, "little"))
+    digest.update(encoded)
+    return digest.digest()
 
 
 def _entry_length(

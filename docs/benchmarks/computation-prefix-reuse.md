@@ -86,6 +86,63 @@ a terminal boundary without changing later generation. Splitting the
 vocabulary head from the transformer was also measured and was slower, so that
 route was rejected.
 
+### Verified remembered-output speculation
+
+A completed greedy response is also retained as a proposal keyed by the exact
+prompt-token identity and runtime profile. On a later match, Exo forks the KV
+frontier copy-on-write, evaluates the remembered tokens as one target-model
+sequence, and returns them only if Gemma's logits verify the complete block.
+The draft is never an answer cache or authority. Corrupt metadata, unsupported
+cache layouts, an invalid token id, or a token mismatch becomes an ordinary
+generation fallback.
+
+The following matrix compares the same warm prefix path with and without the
+remembered output. Times include submit, verification or generation, token
+delivery through Exo's batch loop, and completion handling.
+
+| Output | Verification block | Ordinary | Remembered | Speedup | Accepted |
+|---:|---:|---:|---:|---:|---:|
+| 32 tokens | 8 | 22.4 tok/s | 38.4 tok/s | **1.72x** | 31/31 |
+| 32 tokens | 16 | 22.2 tok/s | 48.1 tok/s | **2.17x** | 31/31 |
+| 32 tokens | 32 | 23.0 tok/s | 72.3 tok/s | **3.14x** | 31/31 |
+| 64 tokens | 64 | 23.7 tok/s | 107.9 tok/s | **4.56x** | 63/63 |
+| 128 tokens | 128 | 26.2 tok/s | 137.2 tok/s | **5.23x** | 127/127 |
+| 256 tokens | 128 | 26.4 tok/s | 147.2 tok/s | **5.58x** | 255/255 |
+
+Every optimized run emitted the exact same token sequence as ordinary greedy
+generation. A 256-token verification block crossed a Gemma/MLX numerical
+divergence boundary in this setup and correctly fell back, so production uses
+128-token blocks rather than assuming that larger is always safe or faster.
+
+The durable control destroyed the writer cache, flushed the KV frontier and
+draft, released the embedded store, and reopened a new persistence instance.
+For 64 output tokens it accepted 63/63 proposals and produced the identical
+sequence at 122.0 tok/s versus 25.7 tok/s ordinary. The small apparent lead
+over the live 111.9 tok/s sample is run-to-run noise and cache warmth, not a
+claim that process restart improves inference.
+
+The draft payload is canonical little-endian token ids: four bytes per token,
+so a 256-token proposal is 1 KiB plus metadata. It does not duplicate model
+weights or the KV checkpoint; those remain governed by the existing prefix
+cache and computation-store policies.
+
+Run the output benchmark with:
+
+```bash
+uv run bench/speculative_continuation.py /path/to/mlx-model \
+  --tokens 128 \
+  --block-size 128 \
+  --durable
+```
+
+This first implementation indexes one most-recent branch per exact prompt. It
+does not yet retrieve approximate branches, learn a branch policy, or apply
+rejection-correct speculative sampling at nonzero temperature. Those are
+separate policy and sampling problems; target-model verification remains the
+authority in every case. Draft memory is bounded by the retained KV frontier
+count, durable publications coalesce by prompt identity, and the configured
+computation-store path must be scoped to the intended sharing domain.
+
 Run the benchmark with:
 
 ```bash

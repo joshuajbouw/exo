@@ -56,7 +56,7 @@ from exo.worker.engines.mlx.patches.opt_batch_gen import (
     set_needs_topk,
     take_ready_topk,
 )
-from exo.worker.engines.mlx.types import KVCacheType, Model
+from exo.worker.engines.mlx.types import DraftContinuation, KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
     system_prompt_token_count,
@@ -86,6 +86,17 @@ def _stop_sequences(task_params: TextGenerationTaskParams) -> list[str]:
     if isinstance(task_params.stop, str):
         return [task_params.stop]
     return task_params.stop
+
+
+def _draft_tokens_are_valid(
+    draft: DraftContinuation,
+    vocab_size: object,
+) -> bool:
+    return (
+        isinstance(vocab_size, int)
+        and vocab_size > 0
+        and all(0 <= token < vocab_size for token in draft.tokens)
+    )
 
 
 @dataclass
@@ -242,10 +253,11 @@ class ExoBatchGenerator:
         seed = task_params.seed if task_params.seed is not None else 42
         mx.random.seed(seed)
 
+        temperature = (
+            task_params.temperature if task_params.temperature is not None else 0.7
+        )
         sampler = make_sampler(
-            temp=task_params.temperature
-            if task_params.temperature is not None
-            else 0.7,
+            temp=temperature,
             top_p=task_params.top_p if task_params.top_p is not None else 1.0,
             min_p=task_params.min_p if task_params.min_p is not None else 0.05,
             top_k=task_params.top_k if task_params.top_k is not None else 0,
@@ -265,10 +277,27 @@ class ExoBatchGenerator:
             eos_ids = eos_ids_from_tokenizer(self.tokenizer)
             logits_processors = [ban_token_ids(eos_ids)] + logits_processors
 
-        max_tokens = task_params.max_output_tokens or MAX_TOKENS
-        can_fuse_continuation = (
-            continuation_used
+        draft = None
+        if (
+            self.kv_prefix_cache is not None
+            and temperature == 0
             and self.group is None
+            and vision is None
+            and not task_params.logprobs
+            and not logits_processors
+            and task_params.stop is None
+        ):
+            draft = self.kv_prefix_cache.resolve_draft(all_prompt_tokens)
+            vocab_size = getattr(self.tokenizer, "vocab_size", None)
+            if draft is not None and not _draft_tokens_are_valid(draft, vocab_size):
+                logger.warning(
+                    "Speculative draft contains invalid token ids; treating it as a miss"
+                )
+                draft = None
+
+        max_tokens = task_params.max_output_tokens or MAX_TOKENS
+        can_fuse_prefill = (
+            self.group is None
             and vision is None
             and not task_params.logprobs
             and not logits_processors
@@ -278,12 +307,11 @@ class ExoBatchGenerator:
             and len(self._mlx_gen._prompt_batch) == 0
             and not self._mlx_gen._unprocessed_sequences
         )
-        if can_fuse_continuation:
-            # The continuation cache is an independent fork at its exact
-            # frontier, so appending never needs rollback snapshots.  Cache
-            # types such as RotatingKVCache are unsafe to *trim*, but are safe
-            # to extend here; routing them through generic prefill needlessly
-            # copied every layer before doing the same model call.
+        if can_fuse_prefill:
+            # Prefix lookup returned an isolated cache fork, so appending does
+            # not mutate the retained frontier. Cache types such as
+            # RotatingKVCache are unsafe to *trim*, but safe to extend here;
+            # generic prefill otherwise copies every layer before the same call.
             started = time.perf_counter()
             if on_prefill_progress is not None:
                 on_prefill_progress(0, len(prompt_tokens))
@@ -323,6 +351,7 @@ class ExoBatchGenerator:
                 logits_processors,
                 internals._default_state_machine,  # pyright: ignore[reportPrivateUsage]
                 max_tokens,
+                draft.tokens if draft is not None else None,
             )
             internals._generation_batch = primed  # pyright: ignore[reportPrivateUsage]
             self._active_tasks[uid] = _EngineTask(
@@ -478,6 +507,11 @@ class ExoBatchGenerator:
         _step_tic = time.perf_counter()
         _, responses = self._mlx_gen.next()
         _next_elapsed = time.perf_counter() - _step_tic
+        if not gb.uids:
+            # MLX filters completed members but knows nothing about Exo's
+            # ahead-of-output speculative state. Release those references now
+            # rather than retaining a response-sized cache until the next task.
+            prepare_for_batch_extension(gb)
 
         topk = take_ready_topk(gb)
 
@@ -603,6 +637,11 @@ class ExoBatchGenerator:
             )
 
             if is_done:
+                if self.kv_prefix_cache is not None:
+                    self.kv_prefix_cache.remember_draft(
+                        state.all_prompt_tokens,
+                        state.generated_token_ids,
+                    )
                 if (
                     response.prompt_cache is not None
                     and self.kv_prefix_cache is not None

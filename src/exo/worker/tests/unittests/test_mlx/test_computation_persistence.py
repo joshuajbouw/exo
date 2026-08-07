@@ -143,6 +143,40 @@ def test_continuation_alias_round_trips_exact_frontier(tmp_path: Path):
     persistence.close()
 
 
+def test_speculative_draft_round_trips_as_non_authoritative_tokens(tmp_path: Path):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+
+    persistence.schedule_draft(prompt, [8, 9, 10])
+    persistence.close()
+
+    reopened = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    resolved = reopened.resolve_draft(prompt)
+    assert resolved is not None
+    assert resolved.tokens == (8, 9, 10)
+    assert reopened.resolve_draft(mx.array([1, 2, 3, 5])) is None
+    reopened.close()
+
+
+def test_tampered_speculative_draft_fails_closed(tmp_path: Path):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+    persistence.schedule_draft(prompt, [8, 9, 10])
+    persistence.close()
+    key = next(
+        key for path, key in _FakeComputationStore.values if key.startswith("draft/v1/")
+    )
+    _FakeComputationStore.values[(str(tmp_path / "store"), key)] = b"not-json"
+
+    reopened = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    assert reopened.resolve_draft(prompt) is None
+    reopened.close()
+
+
 def test_tampered_continuation_alias_fails_closed(tmp_path: Path):
     _install_fake_store()
     _reset_fake_store()

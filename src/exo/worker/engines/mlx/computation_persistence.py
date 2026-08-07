@@ -21,7 +21,11 @@ from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
 
 from exo.worker.engines.mlx.cache import cache_length
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
-from exo.worker.engines.mlx.types import ContinuationFrontier, KVCacheType
+from exo.worker.engines.mlx.types import (
+    ContinuationFrontier,
+    DraftContinuation,
+    KVCacheType,
+)
 from exo.worker.runner.bootstrap import logger
 
 if TYPE_CHECKING:
@@ -53,7 +57,15 @@ class _PreparedCheckpoint:
     prompt_tokens: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedDraft:
+    prefix_id: str
+    prompt_token_count: int
+    output_tokens: bytes
+
+
 type _PendingCheckpoint = _LazyCheckpoint | _PreparedCheckpoint
+type _PendingPublication = _PendingCheckpoint | _PreparedDraft
 type _ProjectionFingerprint = tuple[int, int, int, int, int]
 
 
@@ -75,6 +87,15 @@ class _ContinuationMetadata(msgspec.Struct, frozen=True):
     prefix_id: str
     token_count: int
     prompt_tokens: bytes
+
+
+class _DraftMetadata(msgspec.Struct, frozen=True):
+    schema: int
+    runtime_profile: str
+    prefix_id: str
+    prompt_token_count: int
+    output_token_count: int
+    output_tokens: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +139,7 @@ class StoreKVPrefixPersistence:
         self._projection_lock = Lock()
         self._verified_projections: dict[Path, tuple[_ProjectionFingerprint, str]] = {}
         self._publication = Condition()
-        self._pending: deque[_PendingCheckpoint] = deque()
+        self._pending: deque[_PendingPublication] = deque()
         self._closing = False
         self._projections = store_path / "projections"
         self._projections.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -278,6 +299,69 @@ class StoreKVPrefixPersistence:
             )
             return None
 
+    def schedule_draft(
+        self,
+        prompt_tokens: mx.array,
+        output_tokens: list[int],
+    ) -> None:
+        """Publish a speculative proposal off the inference critical path."""
+        if not output_tokens:
+            return
+        prompt_bytes = np.asarray(prompt_tokens, dtype="<u4").tobytes(order="C")
+        prepared = _PreparedDraft(
+            prefix_id=_prefix_id_from_bytes(
+                self._runtime_profile,
+                len(prompt_tokens),
+                prompt_bytes,
+            ),
+            prompt_token_count=len(prompt_tokens),
+            output_tokens=np.asarray(output_tokens, dtype="<u4").tobytes(order="C"),
+        )
+        with self._publication:
+            if self._closing:
+                return
+            for index in range(len(self._pending) - 1, -1, -1):
+                queued = self._pending[index]
+                if (
+                    isinstance(queued, _PreparedDraft)
+                    and queued.prefix_id == prepared.prefix_id
+                ):
+                    self._pending[index] = prepared
+                    break
+            else:
+                self._pending.append(prepared)
+            self._publication.notify()
+
+    def resolve_draft(self, prompt_tokens: mx.array) -> DraftContinuation | None:
+        """Load an identity-bound proposal which still requires model verification."""
+        try:
+            prompt_bytes = np.asarray(prompt_tokens, dtype="<u4").tobytes(order="C")
+            prefix_id = _prefix_id_from_bytes(
+                self._runtime_profile,
+                len(prompt_tokens),
+                prompt_bytes,
+            )
+            encoded = self._store.get(_draft_key(self._profile_id, prefix_id))
+            if encoded is None:
+                return None
+            metadata = msgspec.json.decode(bytes(encoded), type=_DraftMetadata)
+            if (
+                metadata.schema != _SCHEMA
+                or metadata.runtime_profile != self._profile_id
+                or metadata.prefix_id != prefix_id
+                or metadata.prompt_token_count != len(prompt_tokens)
+                or metadata.output_token_count <= 0
+                or len(metadata.output_tokens) != metadata.output_token_count * 4
+            ):
+                raise ValueError("speculative draft metadata mismatch")
+            values = np.frombuffer(metadata.output_tokens, dtype="<u4")
+            return DraftContinuation(tuple(cast(list[int], values.tolist())))
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Speculative draft metadata failed verification; treating it as a miss"
+            )
+            return None
+
     def schedule_store(
         self,
         prompt_tokens: mx.array,
@@ -339,6 +423,8 @@ class StoreKVPrefixPersistence:
         continuation_id = checkpoint.continuation_id
         for index in range(len(self._pending) - 1, -1, -1):
             queued = self._pending[index]
+            if isinstance(queued, _PreparedDraft):
+                continue
             if queued.continuation_id == continuation_id:
                 if isinstance(queued, _PreparedCheckpoint):
                     queued.source.unlink(missing_ok=True)
@@ -359,21 +445,37 @@ class StoreKVPrefixPersistence:
                     self._publication.wait()
                 if not self._pending:
                     return
-                checkpoint = self._pending.popleft()
+                publication = self._pending.popleft()
             try:
-                if isinstance(checkpoint, _PreparedCheckpoint):
-                    self._publish_checkpoint(checkpoint)
+                if isinstance(publication, _PreparedDraft):
+                    self._publish_draft(publication)
+                elif isinstance(publication, _PreparedCheckpoint):
+                    self._publish_checkpoint(publication)
                 else:
                     self._store_checkpoint(
-                        checkpoint.prompt_tokens,
-                        checkpoint.cache,
-                        checkpoint.prefill_tps,
-                        checkpoint.continuation_id,
+                        publication.prompt_tokens,
+                        publication.cache,
+                        publication.prefill_tps,
+                        publication.continuation_id,
                     )
             except Exception:
                 logger.opt(exception=True).warning(
-                    "KV checkpoint publication failed; inference result remains valid"
+                    "Computation publication failed; inference result remains valid"
                 )
+
+    def _publish_draft(self, draft: _PreparedDraft) -> None:
+        metadata = _DraftMetadata(
+            schema=_SCHEMA,
+            runtime_profile=self._profile_id,
+            prefix_id=draft.prefix_id,
+            prompt_token_count=draft.prompt_token_count,
+            output_token_count=len(draft.output_tokens) // 4,
+            output_tokens=draft.output_tokens,
+        )
+        self._store.set(
+            _draft_key(self._profile_id, draft.prefix_id),
+            msgspec.json.encode(metadata),
+        )
 
     def _store_checkpoint(
         self,
@@ -696,3 +798,7 @@ def _index_key(profile_id: str) -> str:
 
 def _continuation_key(profile_id: str, continuation_id: str) -> str:
     return f"continuation/v1/{profile_id}/{_digest(continuation_id.encode())}"
+
+
+def _draft_key(profile_id: str, prefix_id: str) -> str:
+    return f"draft/v1/{profile_id}/{prefix_id}"

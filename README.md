@@ -372,6 +372,16 @@ seconds versus 24.005 seconds for a cold replay, an 81.2x speedup; reopening
 the same frontier through the durable store after discarding process-local
 state took 0.545 seconds, a 44.1x speedup. Both produced identical output.
 
+Completed greedy outputs also become non-authoritative speculative drafts for
+the same exact prompt. Gemma verifies remembered tokens in bounded target-model
+passes before Exo returns them; a mismatch discards the speculative fork and
+ordinary generation continues. On the same M2 Ultra, a 128-token response rose
+from 26.2 to 137.2 output tokens/second (**5.23x**) with all 127 eligible tokens
+verified and byte-identical output. A fresh computation-store reopen verified a
+64-token draft at 122.0 tokens/second versus 25.7 tokens/second ordinary. This
+path currently applies only to single-device, text-only greedy generation
+without logits processors or custom stop strings.
+
 ---
 
 ### Using the API

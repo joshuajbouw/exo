@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, cast
 
@@ -7,9 +8,14 @@ from mlx_lm.models.cache import (
     TokenBuffer,  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]
 )
 
+from exo.worker.engines.mlx.cache import cache_length, fork_kv_cache_for_append
 from exo.worker.engines.mlx.types import KVCacheType, Model
 
 _PRECOMPUTE_TOP_K = 20
+# The Gemma 4 MLX path remains byte-identical to serial greedy generation at
+# this size in the real-model matrix. Larger single passes crossed a numerical
+# divergence boundary and are deliberately not used by the production path.
+_SPECULATIVE_BLOCK_SIZE = 128
 _ORIGINAL_EXTRACT_CACHE = GenerationBatch.extract_cache
 
 
@@ -29,6 +35,7 @@ def make_primed_generation_batch(
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
     state_machine: GenerationStateMachine,
     max_tokens: int,
+    draft_tokens: tuple[int, ...] | None = None,
 ) -> GenerationBatch:
     """Build a generation batch whose first token was sampled during prefill."""
     batch = GenerationBatch.__new__(GenerationBatch)
@@ -47,6 +54,12 @@ def make_primed_generation_batch(
     batch._next_logprobs = logprobs
     batch._direct_generation = True  # pyright: ignore[reportAttributeAccessIssue]
     batch._primed_response_pending = True  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_draft = draft_tokens  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_cursor = 0  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_queue = deque()  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_base_cache = None  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_replay_tokens = []  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_accepted = 0  # pyright: ignore[reportAttributeAccessIssue]
     batch._token_context = [TokenBuffer(all_tokens)]
     batch._num_tokens = [0]
     batch._matcher_states = [state_machine.make_state()]
@@ -199,12 +212,25 @@ def _direct_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         else:
             mx.eval(inputs, *current_logprobs)
         token_list = cast(list[int], inputs.tolist())
+        draft = cast(
+            tuple[int, ...] | None,
+            getattr(self, "_speculative_draft", None),
+        )
+        if draft and token_list[0] == draft[0]:
+            self._speculative_cursor = 1  # pyright: ignore[reportAttributeAccessIssue]
+        else:
+            self._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
         for tokens, token in zip(self.tokens, token_list, strict=True):
             tokens.append(token)
         if isinstance(current_logprobs, mx.array):
             current_logprobs = list(current_logprobs)
         return token_list, current_logprobs
 
+    speculative = _next_speculative_token(self, inputs)
+    if speculative is not None:
+        return speculative
+
+    _clear_speculative_rebase(self)
     sampled, logprobs = _advance_direct_state(self, inputs)
     self._next_tokens = sampled
     self._next_logprobs = logprobs
@@ -212,6 +238,88 @@ def _direct_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     for tokens, token in zip(self.tokens, token_list, strict=True):
         tokens.append(token)
     return token_list, list(logprobs)
+
+
+def _next_speculative_token(
+    batch: GenerationBatch,
+    inputs: mx.array,
+) -> tuple[list[int], list[mx.array]] | None:
+    queue = cast(
+        deque[tuple[int, mx.array]] | None,
+        getattr(batch, "_speculative_queue", None),
+    )
+    if queue is None:
+        return None
+    if not queue and not _verify_next_draft_block(batch, inputs):
+        return None
+    token, logprobs = queue.popleft()
+    batch._next_tokens = mx.array([token], dtype=mx.uint32)
+    batch._next_logprobs = logprobs[None]
+    replay = cast(list[int], batch._speculative_replay_tokens)  # pyright: ignore[reportAttributeAccessIssue]
+    replay.append(token)
+    batch.tokens[0].append(token)
+    return [token], [logprobs]
+
+
+def _verify_next_draft_block(batch: GenerationBatch, inputs: mx.array) -> bool:
+    """Verify one remembered block and publish it only on an exact greedy match."""
+    draft = cast(
+        tuple[int, ...] | None,
+        getattr(batch, "_speculative_draft", None),
+    )
+    cursor = cast(int, getattr(batch, "_speculative_cursor", 0))
+    if draft is None or cursor >= len(draft) or len(batch.uids) != 1:
+        return False
+    remaining_budget = batch.max_tokens[0] - batch._num_tokens[0]
+    block_size = min(
+        _SPECULATIVE_BLOCK_SIZE,
+        len(draft) - cursor,
+        remaining_budget,
+    )
+    # One token offers no parallelism and cannot use the copy-on-write fork.
+    if block_size < 2:
+        return False
+
+    current = int(batch.tokens[0][-1])
+    expected = draft[cursor : cursor + block_size]
+    model_inputs = (current, *expected[:-1])
+    base_cache = list(batch.prompt_cache)
+    forked = fork_kv_cache_for_append(
+        base_cache,
+        cache_length(base_cache),
+        len(model_inputs),
+    )
+    if forked is None:
+        batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+        return False
+
+    logits = batch.model(mx.array([model_inputs], dtype=mx.uint32), cache=forked)
+    predicted = mx.argmax(logits, axis=-1)
+    mx.eval(
+        predicted,
+        [entry.state for entry in forked],  # pyright: ignore[reportArgumentType]
+    )
+    if tuple(cast(list[int], predicted[0].tolist())) != expected:
+        batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+        return False
+
+    batch._speculative_base_cache = base_cache  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_replay_tokens = [current]  # pyright: ignore[reportAttributeAccessIssue]
+    batch.prompt_cache = forked
+    queue = cast(deque[tuple[int, mx.array]], batch._speculative_queue)  # pyright: ignore[reportAttributeAccessIssue]
+    # This path is gated off when the caller requests logprobs. Avoid retaining
+    # one full vocabulary row per accepted token merely to discard it later.
+    no_logprobs = mx.array([], dtype=mx.float32)
+    queue.extend((token, no_logprobs) for token in expected)
+    batch._speculative_cursor = cursor + block_size  # pyright: ignore[reportAttributeAccessIssue]
+    accepted = cast(int, batch._speculative_accepted)  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_accepted = accepted + block_size  # pyright: ignore[reportAttributeAccessIssue]
+    return True
+
+
+def _clear_speculative_rebase(batch: GenerationBatch) -> None:
+    batch._speculative_base_cache = None  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_replay_tokens = []  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _advance_direct_state(
@@ -239,7 +347,27 @@ def prepare_for_batch_extension(batch: GenerationBatch) -> None:
     """Convert a direct singleton back to MLX's mergeable batch semantics."""
     if not getattr(batch, "_direct_generation", False):
         return
+    uids = cast(list[int] | None, getattr(batch, "uids", None))
+    if uids is not None and not uids:
+        batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
+        batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+        queue = cast(
+            deque[tuple[int, mx.array]] | None,
+            getattr(batch, "_speculative_queue", None),
+        )
+        if queue is not None:
+            queue.clear()
+        _clear_speculative_rebase(batch)
+        return
     if cast(bool, batch._primed_response_pending):  # pyright: ignore[reportAttributeAccessIssue]
+        batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
+        return
+    base_cache = cast(
+        KVCacheType | None,
+        getattr(batch, "_speculative_base_cache", None),
+    )
+    if base_cache is not None:
+        _rebase_speculative_batch(batch)
         batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
         return
     inputs = batch._next_tokens
@@ -248,6 +376,40 @@ def prepare_for_batch_extension(batch: GenerationBatch) -> None:
     batch._next_tokens = sampled
     batch._next_logprobs = logprobs
     batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _rebase_speculative_batch(batch: GenerationBatch) -> None:
+    """Discard ahead-of-output state before merging another request."""
+    base_cache = cast(KVCacheType, batch._speculative_base_cache)  # pyright: ignore[reportAttributeAccessIssue]
+    replay = cast(list[int], batch._speculative_replay_tokens)  # pyright: ignore[reportAttributeAccessIssue]
+    forked = fork_kv_cache_for_append(
+        base_cache,
+        cache_length(base_cache),
+        len(replay),
+    )
+    if forked is None:
+        raise RuntimeError("speculative cache cannot be safely rebased")
+    logits = batch.model(mx.array([replay], dtype=mx.uint32), cache=forked)
+    last_logits = logits[:, -1, :]
+    logprobs = last_logits - mx.logsumexp(last_logits, axis=-1, keepdims=True)
+    queue = cast(deque[tuple[int, mx.array]], batch._speculative_queue)  # pyright: ignore[reportAttributeAccessIssue]
+    if queue:
+        next_token = mx.array([queue[0][0]], dtype=mx.uint32)
+    elif batch.samplers is not None and batch.samplers[0] is not None:
+        next_token = batch.samplers[0](logprobs)
+    else:
+        next_token = batch.fallback_sampler(logprobs)
+    mx.eval(
+        next_token,
+        logprobs,
+        [entry.state for entry in forked],  # pyright: ignore[reportArgumentType]
+    )
+    batch.prompt_cache = forked
+    batch._next_tokens = next_token
+    batch._next_logprobs = logprobs
+    batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+    queue.clear()
+    _clear_speculative_rebase(batch)
 
 
 def _patched_extract_cache(self: GenerationBatch, idx: int) -> list[object]:

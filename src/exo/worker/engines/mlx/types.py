@@ -42,6 +42,13 @@ class ContinuationPrompt:
     token_bytes: bytes | None
 
 
+@dataclass(frozen=True, slots=True)
+class DraftContinuation:
+    """Previously generated tokens proposed for target-model verification."""
+
+    tokens: tuple[int, ...]
+
+
 # Model is a wrapper function to fix the fact that mlx is not strongly typed in the same way that EXO is.
 # For example - MLX has no guarantee of the interface that nn.Module will expose. But we need a guarantee that it has a __call__() function
 class Model(nn.Module):

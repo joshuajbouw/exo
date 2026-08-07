@@ -12,7 +12,11 @@ from typing import TYPE_CHECKING, Protocol
 
 import mlx.core as mx
 
-from exo.worker.engines.mlx.types import ContinuationFrontier, KVCacheType
+from exo.worker.engines.mlx.types import (
+    ContinuationFrontier,
+    DraftContinuation,
+    KVCacheType,
+)
 
 from .cache import CacheSnapshot
 
@@ -72,6 +76,16 @@ class KVPrefixPersistence(Protocol):
 
     def resolve_continuation(self, continuation_id: str) -> ContinuationFrontier | None:
         """Resolve an opaque response identity to its exact token frontier."""
+
+    def schedule_draft(
+        self,
+        prompt_tokens: mx.array,
+        output_tokens: list[int],
+    ) -> None:
+        """Schedule a prior output as a non-authoritative speculative draft."""
+
+    def resolve_draft(self, prompt_tokens: mx.array) -> DraftContinuation | None:
+        """Resolve a candidate whose tokens still require model verification."""
 
     def close(self) -> None:
         """Finish accepted publications and release backend resources."""
