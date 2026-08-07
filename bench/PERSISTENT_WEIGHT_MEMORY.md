@@ -76,6 +76,11 @@ The useful architecture is narrower:
 7. After the turn, KV state may be discarded. The corpus, proofs, and optional
    expert persist independently and can be reconstructed for another model.
 
+The follow-up contract and its pre-model algebra gates are in
+[`NEURAL_PARAMETER_PAGES.md`](NEURAL_PARAMETER_PAGES.md). It replaces prompt-
+or learned-router scoping with a capability-scoped Tensor Logic activation
+proof and treats conflicting adapter composition as an error by default.
+
 This preserves the desired context-scrubbing property without pretending that
 weights are an exact database. The next inference experiment should test
 explicitly gated expert activation and composition, not another globally
