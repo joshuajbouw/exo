@@ -38,7 +38,9 @@ class CheckpointDeltaLayer(msgspec.Struct, frozen=True):
 @dataclass(frozen=True, slots=True)
 class PreparedCheckpointDelta:
     layers: tuple[CheckpointDeltaLayer, ...]
-    tensor_bytes: int
+    novel_tensor_bytes: int
+    inherited_tensor_bytes: int
+    successor_tensor_bytes: int
 
 
 class _CacheRuntime(Protocol):
@@ -84,6 +86,8 @@ def prepare_checkpoint_delta(
     arrays: dict[str, mx.array] = {}
     layers: list[CheckpointDeltaLayer] = []
     tensor_bytes = 0
+    inherited_tensor_bytes = 0
+    successor_tensor_bytes = 0
     for index, (base_entry, successor_entry) in enumerate(
         zip(base, successor, strict=True)
     ):
@@ -122,6 +126,12 @@ def prepare_checkpoint_delta(
         arrays[f"{index}.keys"] = novel_keys
         arrays[f"{index}.values"] = novel_values
         tensor_bytes += novel_keys.nbytes + novel_values.nbytes
+        inherited_tensor_bytes += (
+            successor_key_overlap.nbytes + successor_value_overlap.nbytes
+        )
+        successor_tensor_bytes += (
+            successor_state.keys.nbytes + successor_state.values.nbytes
+        )
         layers.append(
             CheckpointDeltaLayer(
                 cache_type=type(successor_entry).__name__,
@@ -141,7 +151,12 @@ def prepare_checkpoint_delta(
     mx.save_safetensors(  # pyright: ignore[reportUnknownMemberType]
         str(path), arrays, {"format": _FORMAT}
     )
-    return PreparedCheckpointDelta(tuple(layers), tensor_bytes)
+    return PreparedCheckpointDelta(
+        tuple(layers),
+        tensor_bytes,
+        inherited_tensor_bytes,
+        successor_tensor_bytes,
+    )
 
 
 def restore_checkpoint_delta(

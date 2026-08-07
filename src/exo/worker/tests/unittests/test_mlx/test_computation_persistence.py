@@ -14,6 +14,7 @@ from exo.worker.engines.mlx.computation_persistence import (
     _prefix_id,
     _scoped_runtime_profile,
 )
+from exo.worker.engines.mlx.computation_policy import ComputationRetentionPolicy
 
 
 class _FakeComputationStore:
@@ -151,6 +152,52 @@ def test_checkpoint_delta_reconstructs_after_all_projections_are_evicted(
     assert mx.array_equal(restored.cache[0].state[0], cache.state[0])
     assert mx.array_equal(restored.cache[0].state[1], cache.state[1])
     assert _FakeComputationStore.get_file_calls == 2
+    persistence.close()
+
+
+def test_recovery_slo_flattens_by_measured_cost_instead_of_generation_count(
+    tmp_path: Path,
+):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(
+        tmp_path / "store",
+        "profile-a",
+        ComputationRetentionPolicy(maximum_cold_reconstruction_seconds=1e-12),
+    )
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys)
+    persistence._store_checkpoint(mx.array([1, 2, 3]), [cache], 1.0)
+    cache.update_and_fetch(keys[..., :1, :], keys[..., :1, :])
+    successor = mx.array([1, 2, 3, 4])
+    persistence._store_checkpoint(successor, [cache], 1.0)
+
+    metadata = persistence._read_metadata(_prefix_id("profile-a", successor))
+    assert metadata is not None
+    assert metadata.representation == "full"
+    assert metadata.cold_reconstruction_seconds == 0.0
+    persistence.close()
+
+
+def test_projection_budget_can_evict_current_leaf_without_losing_checkpoint(
+    tmp_path: Path,
+):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(
+        tmp_path / "store",
+        "profile-a",
+        ComputationRetentionPolicy(projection_budget_bytes=1),
+    )
+    prompt = mx.array([1, 2, 3])
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys)
+    persistence._store_checkpoint(prompt, [cache], 1.0)
+
+    assert not list((tmp_path / "store" / "projections").glob("*.safetensors"))
+    assert persistence.restore_longest(prompt, 0, []) is not None
     persistence.close()
 
 

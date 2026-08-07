@@ -113,6 +113,11 @@ rotating-cache deltas. TTFT rose to 3.06 seconds with one missing delta
 generation and 4.06 seconds with two. That path is exact and fail-closed, but
 its roughly linear chain cost establishes the next representation task:
 cost-triggered flattening or materialization, not a fixed generation limit.
+The persistence policy now accepts an operator recovery SLO and flattens when
+the cumulative measured reconstruction cost crosses it. Publication accounting
+reports representation kind, content payload, warm-projection bytes, reclaimed
+projection bytes, and inherited versus novel tensor bytes. These are host-side
+resource metrics; they do not report cross-domain dedup hits.
 
 The tensor-overlap probe then compared the two completed frontier files using
 each cache entry's logical token interval rather than its physical ring-buffer

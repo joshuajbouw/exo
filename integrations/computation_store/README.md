@@ -22,6 +22,17 @@ EXO_COMPUTATION_STORE="$HOME/.local/share/exo/computation"
 EXO_COMPUTATION_RUNTIME_PROFILE="exact-model-and-runtime-identity"
 ```
 
+An owning resource authority may additionally set
+`EXO_COMPUTATION_PROJECTION_BUDGET_BYTES`. There is deliberately no built-in
+byte ceiling: without an explicit budget, lineage ancestors are still evicted
+after successor publication while independent leaf frontiers remain warm. A
+budget evicts the oldest remaining projections and can be smaller than one
+projection; exhaustion loses warmth, never a valid checkpoint.
+`EXO_COMPUTATION_MAX_COLD_RECONSTRUCTION_SECONDS` supplies a recovery SLO for
+cost-triggered chain flattening. Each delta records its measured reconstruction
+cost plus its base's cumulative cost; a successor whose estimate exceeds the
+SLO publishes as a complete checkpoint. It does not impose a generation count.
+
 The adapter deliberately exposes only verified named content and durable KV.
 Exo owns MLX checkpoint serialization and semantic compatibility. The initial
 integration uses KV as a replaceable lookup projection; a future shared

@@ -44,7 +44,9 @@ def test_delta_round_trips_append_only_and_wrapped_rotating_cache(tmp_path: Path
         prepared.layers,
     )
 
-    assert prepared.tensor_bytes == 2 * 2 * 2 * 3 * 4 * 4
+    assert prepared.novel_tensor_bytes == 2 * 2 * 2 * 3 * 4 * 4
+    assert prepared.inherited_tensor_bytes == 7 * 2 * 2 * 4 * 4
+    assert prepared.successor_tensor_bytes == 13 * 2 * 2 * 4 * 4
     assert mx.array_equal(restored[0].state[0], successor_kv.state[0])
     assert mx.array_equal(restored[0].state[1], successor_kv.state[1])
     assert isinstance(restored[1], RotatingKVCache)

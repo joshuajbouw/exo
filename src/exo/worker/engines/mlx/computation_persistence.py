@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import tempfile
 import time
@@ -23,8 +24,13 @@ from exo.worker.engines.mlx.cache import cache_length
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
 from exo.worker.engines.mlx.checkpoint_delta import (
     CheckpointDeltaLayer,
+    PreparedCheckpointDelta,
     prepare_checkpoint_delta,
     restore_checkpoint_delta,
+)
+from exo.worker.engines.mlx.computation_policy import (
+    ComputationRetentionPolicy,
+    reclaim_projection_budget,
 )
 from exo.worker.engines.mlx.types import (
     ContinuationFrontier,
@@ -38,7 +44,7 @@ if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import MediaRegion
 
 
-_SCHEMA = 3
+_SCHEMA = 4
 _PREFIX_DOMAIN = b"exo-mlx-prefix-state-v1\0"
 
 
@@ -69,6 +75,14 @@ class _PreparedDraft:
     output_tokens: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedDeltaPublication:
+    source: Path
+    base_prefix_id: str
+    delta: PreparedCheckpointDelta
+    cold_reconstruction_seconds: float
+
+
 type _PendingCheckpoint = _LazyCheckpoint | _PreparedCheckpoint
 type _PendingPublication = _PendingCheckpoint | _PreparedDraft
 type _ProjectionFingerprint = tuple[int, int, int, int, int]
@@ -84,6 +98,7 @@ class _CheckpointMetadata(msgspec.Struct, frozen=True):
     projection_digest: str
     base_prefix_id: str | None
     delta_layers: tuple[CheckpointDeltaLayer, ...]
+    cold_reconstruction_seconds: float
     token_count: int
     cache_tokens: int
     prefill_tps: float
@@ -119,6 +134,12 @@ class PublicationMetrics:
     mlx_serialization_seconds: float = 0.0
     store_admission_seconds: float = 0.0
     metadata_publication_seconds: float = 0.0
+    representation: str = "none"
+    content_payload_bytes: int = 0
+    projection_bytes: int = 0
+    projection_bytes_reclaimed: int = 0
+    inherited_tensor_bytes: int = 0
+    novel_tensor_bytes: int = 0
 
 
 class StoreKVPrefixPersistence:
@@ -130,7 +151,12 @@ class StoreKVPrefixPersistence:
     silently restoring incompatible accelerator state.
     """
 
-    def __init__(self, store_path: Path, runtime_profile: str):
+    def __init__(
+        self,
+        store_path: Path,
+        runtime_profile: str,
+        retention_policy: ComputationRetentionPolicy | None = None,
+    ):
         try:
             from exo_computation_store import ComputationStore
         except ImportError as error:
@@ -152,6 +178,7 @@ class StoreKVPrefixPersistence:
         self._closing = False
         self._projections = store_path / "projections"
         self._projections.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._retention_policy = retention_policy or ComputationRetentionPolicy()
         self.last_restore_metrics = RestoreMetrics()
         self.last_publication_metrics = PublicationMetrics()
         self._worker = Thread(
@@ -500,6 +527,7 @@ class StoreKVPrefixPersistence:
     def _publish_checkpoint(self, checkpoint: _PreparedCheckpoint) -> None:
         source = checkpoint.source
         delta_source: Path | None = None
+        delta_accounting: PreparedCheckpointDelta | None = None
         started = time.perf_counter()
         try:
             prepared_delta = self._prepare_delta(checkpoint)
@@ -507,18 +535,25 @@ class StoreKVPrefixPersistence:
                 representation = "full"
                 base_prefix_id = None
                 delta_layers: tuple[CheckpointDeltaLayer, ...] = ()
+                cold_reconstruction_seconds = 0.0
                 content_object, content_digest = self._store.put_file(
                     _content_name(self._profile_id, checkpoint.prefix_id), source
                 )
+                content_payload_bytes = source.stat().st_size
                 projection_digest = content_digest
             else:
-                delta_source, base_prefix_id, delta_layers = prepared_delta
+                delta_source = prepared_delta.source
+                base_prefix_id = prepared_delta.base_prefix_id
+                delta_accounting = prepared_delta.delta
+                delta_layers = delta_accounting.layers
+                cold_reconstruction_seconds = prepared_delta.cold_reconstruction_seconds
                 representation = "delta"
                 projection_digest = self._store.digest_file(source)
                 content_object, content_digest = self._store.put_file(
                     _content_name(self._profile_id, checkpoint.prefix_id),
                     delta_source,
                 )
+                content_payload_bytes = delta_source.stat().st_size
             projection = self._projection_path(checkpoint.prefix_id)
             os.replace(source, projection)
             self._remember_verified_projection(
@@ -541,6 +576,7 @@ class StoreKVPrefixPersistence:
             projection_digest=projection_digest,
             base_prefix_id=base_prefix_id,
             delta_layers=delta_layers,
+            cold_reconstruction_seconds=cold_reconstruction_seconds,
             token_count=checkpoint.token_count,
             cache_tokens=checkpoint.cache_tokens,
             prefill_tps=checkpoint.prefill_tps,
@@ -574,18 +610,41 @@ class StoreKVPrefixPersistence:
                 ),
                 msgspec.json.encode(continuation),
             )
-        if base_prefix_id is not None:
-            self._evict_projection(base_prefix_id)
+        ancestor_projection_reclaimed = (
+            self._evict_projection(base_prefix_id) if base_prefix_id is not None else 0
+        )
+        reclamation = reclaim_projection_budget(
+            self._projections,
+            self._retention_policy.projection_budget_bytes,
+        )
+        for reclaimed in reclamation.paths:
+            self._forget_verified_projection(reclaimed)
         self.last_publication_metrics = PublicationMetrics(
             mlx_serialization_seconds=checkpoint.serialization_seconds,
             store_admission_seconds=admission_seconds,
             metadata_publication_seconds=time.perf_counter() - started,
+            representation=representation,
+            content_payload_bytes=content_payload_bytes,
+            projection_bytes=(projection.stat().st_size if projection.exists() else 0),
+            projection_bytes_reclaimed=(
+                ancestor_projection_reclaimed + reclamation.bytes_reclaimed
+            ),
+            inherited_tensor_bytes=(
+                delta_accounting.inherited_tensor_bytes
+                if delta_accounting is not None
+                else 0
+            ),
+            novel_tensor_bytes=(
+                delta_accounting.novel_tensor_bytes
+                if delta_accounting is not None
+                else 0
+            ),
         )
 
     def _prepare_delta(
         self,
         checkpoint: _PreparedCheckpoint,
-    ) -> tuple[Path, str, tuple[CheckpointDeltaLayer, ...]] | None:
+    ) -> _PreparedDeltaPublication | None:
         try:
             successor = cast(
                 KVCacheType,
@@ -620,6 +679,7 @@ class StoreKVPrefixPersistence:
                         "canonical", checkpoint.prefix_id
                     )
                     try:
+                        reconstruction_started = time.perf_counter()
                         canonical = restore_checkpoint_delta(
                             delta_source,
                             base,
@@ -634,10 +694,31 @@ class StoreKVPrefixPersistence:
                                 "prefix_id": checkpoint.prefix_id,
                             },
                         )
+                        incremental_reconstruction_seconds = (
+                            time.perf_counter() - reconstruction_started
+                        )
+                        cold_reconstruction_seconds = (
+                            base_metadata.cold_reconstruction_seconds
+                            + incremental_reconstruction_seconds
+                        )
+                        maximum = (
+                            self._retention_policy.maximum_cold_reconstruction_seconds
+                        )
+                        if (
+                            maximum is not None
+                            and cold_reconstruction_seconds > maximum
+                        ):
+                            delta_source.unlink(missing_ok=True)
+                            return None
                         os.replace(canonical_source, checkpoint.source)
                     finally:
                         canonical_source.unlink(missing_ok=True)
-                    return delta_source, base_prefix_id, prepared.layers
+                    return _PreparedDeltaPublication(
+                        delta_source,
+                        base_prefix_id,
+                        prepared,
+                        cold_reconstruction_seconds,
+                    )
                 except Exception:
                     delta_source.unlink(missing_ok=True)
                     raise
@@ -787,6 +868,12 @@ class StoreKVPrefixPersistence:
             or (decoded.representation == "full" and decoded.delta_layers)
             or (decoded.representation == "delta" and decoded.base_prefix_id is None)
             or (decoded.representation == "delta" and not decoded.delta_layers)
+            or not math.isfinite(decoded.cold_reconstruction_seconds)
+            or decoded.cold_reconstruction_seconds < 0.0
+            or (
+                decoded.representation == "full"
+                and decoded.cold_reconstruction_seconds != 0.0
+            )
         ):
             raise ValueError("prefix metadata identity mismatch")
         if decoded.base_prefix_id is not None and not _is_lower_hex(
@@ -851,16 +938,22 @@ class StoreKVPrefixPersistence:
         with self._projection_lock:
             self._verified_projections.pop(projection, None)
 
-    def _evict_projection(self, prefix_id: str) -> None:
+    def _evict_projection(self, prefix_id: str) -> int:
         projection = self._projection_path(prefix_id)
+        try:
+            status = projection.lstat()
+            size = status.st_size if S_ISREG(status.st_mode) else 0
+        except FileNotFoundError:
+            size = 0
         try:
             projection.unlink(missing_ok=True)
         except OSError:
             # A platform may temporarily prevent deletion while another reader
             # has the file open. The projection is disposable; retaining it is
             # a safe loss of economy and a later policy pass can retry.
-            return
+            return 0
         self._forget_verified_projection(projection)
+        return size
 
     def _temporary_path(self, operation: str, prefix_id: str) -> Path:
         descriptor, value = tempfile.mkstemp(
@@ -898,7 +991,11 @@ def configured_computation_persistence(
     )
     profile_store = Path(path) / _digest(scoped_profile.encode())
     try:
-        return StoreKVPrefixPersistence(profile_store, scoped_profile)
+        return StoreKVPrefixPersistence(
+            profile_store,
+            scoped_profile,
+            ComputationRetentionPolicy.from_environment(),
+        )
     except Exception:
         logger.opt(exception=True).warning(
             "computation persistence unavailable; continuing without it"
