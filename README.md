@@ -386,6 +386,14 @@ stop strings. A provider-neutral selector interface lets a GPU corpus or
 relation engine rank additional candidates and receive target-verified
 acceptance feedback without becoming generation authority.
 
+An adjacent [persistent-weight experiment](bench/PERSISTENT_WEIGHT_MEMORY.md)
+tested whether a novel rule could survive a process restart without retained
+context. A small LoRA did persist narrow behavior, but globally enabling it
+overwrote unrelated behavior, and progressively stronger controls rejected it
+as an exact relational-memory mechanism. The resulting boundary is explicit:
+exact memory and proofs stay outside probabilistic weights; any learned expert
+must be derived, scoped, and mounted only for its declared domain.
+
 ---
 
 ### Using the API
