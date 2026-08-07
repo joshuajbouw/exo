@@ -1,3 +1,4 @@
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, cast
@@ -9,6 +10,11 @@ from mlx_lm.models.cache import (
 )
 
 from exo.worker.engines.mlx.cache import cache_length, fork_kv_cache_for_append
+from exo.worker.engines.mlx.draft_selection import (
+    DraftCandidate,
+    DraftSelection,
+    DraftVerificationOutcome,
+)
 from exo.worker.engines.mlx.types import KVCacheType, Model
 
 _PRECOMPUTE_TOP_K = 20
@@ -35,7 +41,9 @@ def make_primed_generation_batch(
     logits_processors: list[Callable[[mx.array, mx.array], mx.array]],
     state_machine: GenerationStateMachine,
     max_tokens: int,
-    draft_tokens: tuple[int, ...] | None = None,
+    draft_selection: DraftSelection | None = None,
+    record_draft_outcome: Callable[[DraftVerificationOutcome], None] | None = None,
+    draft_selection_duration_ns: int = 0,
 ) -> GenerationBatch:
     """Build a generation batch whose first token was sampled during prefill."""
     batch = GenerationBatch.__new__(GenerationBatch)
@@ -54,7 +62,15 @@ def make_primed_generation_batch(
     batch._next_logprobs = logprobs
     batch._direct_generation = True  # pyright: ignore[reportAttributeAccessIssue]
     batch._primed_response_pending = True  # pyright: ignore[reportAttributeAccessIssue]
-    batch._speculative_draft = draft_tokens  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_selection = draft_selection  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_candidates = (  # pyright: ignore[reportAttributeAccessIssue]
+        list(draft_selection.candidates) if draft_selection is not None else []
+    )
+    batch._speculative_candidate = None  # pyright: ignore[reportAttributeAccessIssue]
+    batch._record_draft_outcome = record_draft_outcome  # pyright: ignore[reportAttributeAccessIssue]
+    batch._draft_selection_duration_ns = draft_selection_duration_ns  # pyright: ignore[reportAttributeAccessIssue]
+    batch._draft_verification_duration_ns = 0  # pyright: ignore[reportAttributeAccessIssue]
+    batch._draft_verification_passes = 0  # pyright: ignore[reportAttributeAccessIssue]
     batch._speculative_cursor = 0  # pyright: ignore[reportAttributeAccessIssue]
     batch._speculative_queue = deque()  # pyright: ignore[reportAttributeAccessIssue]
     batch._speculative_base_cache = None  # pyright: ignore[reportAttributeAccessIssue]
@@ -212,14 +228,10 @@ def _direct_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         else:
             mx.eval(inputs, *current_logprobs)
         token_list = cast(list[int], inputs.tolist())
-        draft = cast(
-            tuple[int, ...] | None,
-            getattr(self, "_speculative_draft", None),
-        )
-        if draft and token_list[0] == draft[0]:
+        candidate = _next_matching_candidate(self, 0, token_list[0])
+        if candidate is not None:
+            self._speculative_candidate = candidate  # pyright: ignore[reportAttributeAccessIssue]
             self._speculative_cursor = 1  # pyright: ignore[reportAttributeAccessIssue]
-        else:
-            self._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
         for tokens, token in zip(self.tokens, token_list, strict=True):
             tokens.append(token)
         if isinstance(current_logprobs, mx.array):
@@ -250,8 +262,26 @@ def _next_speculative_token(
     )
     if queue is None:
         return None
-    if not queue and not _verify_next_draft_block(batch, inputs):
-        return None
+    while not queue:
+        candidate = cast(
+            DraftCandidate | None,
+            getattr(batch, "_speculative_candidate", None),
+        )
+        cursor = cast(int, getattr(batch, "_speculative_cursor", 0))
+        if candidate is None:
+            candidate = _next_matching_candidate(batch, cursor, int(inputs[0]))
+            if candidate is None:
+                return None
+            batch._speculative_candidate = candidate  # pyright: ignore[reportAttributeAccessIssue]
+            batch._draft_verification_duration_ns = 0  # pyright: ignore[reportAttributeAccessIssue]
+            batch._draft_verification_passes = 0  # pyright: ignore[reportAttributeAccessIssue]
+        if cursor >= len(candidate.tokens):
+            _finish_candidate(batch, candidate, cursor, None)
+            continue
+        if _verify_next_draft_block(batch, inputs):
+            break
+        if getattr(batch, "_speculative_candidate", None) is candidate:
+            return None
     token, logprobs = queue.popleft()
     batch._next_tokens = mx.array([token], dtype=mx.uint32)
     batch._next_logprobs = logprobs[None]
@@ -262,26 +292,27 @@ def _next_speculative_token(
 
 
 def _verify_next_draft_block(batch: GenerationBatch, inputs: mx.array) -> bool:
-    """Verify one remembered block and publish it only on an exact greedy match."""
-    draft = cast(
-        tuple[int, ...] | None,
-        getattr(batch, "_speculative_draft", None),
+    """Verify one ranked draft block and retain its longest correct prefix."""
+    candidate = cast(
+        DraftCandidate | None,
+        getattr(batch, "_speculative_candidate", None),
     )
     cursor = cast(int, getattr(batch, "_speculative_cursor", 0))
-    if draft is None or cursor >= len(draft) or len(batch.uids) != 1:
+    if candidate is None or cursor >= len(candidate.tokens) or len(batch.uids) != 1:
         return False
     remaining_budget = batch.max_tokens[0] - batch._num_tokens[0]
     block_size = min(
         _SPECULATIVE_BLOCK_SIZE,
-        len(draft) - cursor,
+        len(candidate.tokens) - cursor,
         remaining_budget,
     )
     # One token offers no parallelism and cannot use the copy-on-write fork.
     if block_size < 2:
+        _finish_candidate(batch, candidate, cursor, None)
         return False
 
     current = int(batch.tokens[0][-1])
-    expected = draft[cursor : cursor + block_size]
+    expected = candidate.tokens[cursor : cursor + block_size]
     model_inputs = (current, *expected[:-1])
     base_cache = list(batch.prompt_cache)
     forked = fork_kv_cache_for_append(
@@ -290,18 +321,38 @@ def _verify_next_draft_block(batch: GenerationBatch, inputs: mx.array) -> bool:
         len(model_inputs),
     )
     if forked is None:
-        batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+        _finish_candidate(batch, candidate, cursor, cursor)
         return False
 
+    verification_started = time.perf_counter_ns()
     logits = batch.model(mx.array([model_inputs], dtype=mx.uint32), cache=forked)
     predicted = mx.argmax(logits, axis=-1)
     mx.eval(
         predicted,
         [entry.state for entry in forked],  # pyright: ignore[reportArgumentType]
     )
-    if tuple(cast(list[int], predicted[0].tolist())) != expected:
-        batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+    elapsed = time.perf_counter_ns() - verification_started
+    batch._draft_verification_duration_ns = (  # pyright: ignore[reportAttributeAccessIssue]
+        cast(int, getattr(batch, "_draft_verification_duration_ns", 0)) + elapsed
+    )
+    batch._draft_verification_passes = (  # pyright: ignore[reportAttributeAccessIssue]
+        cast(int, getattr(batch, "_draft_verification_passes", 0)) + 1
+    )
+    actual = tuple(cast(list[int], predicted[0].tolist()))
+    accepted_count = 0
+    for actual_token, expected_token in zip(actual, expected, strict=True):
+        if actual_token != expected_token:
+            break
+        accepted_count += 1
+    if accepted_count == 0:
+        _finish_candidate(batch, candidate, cursor, cursor)
         return False
+
+    if accepted_count < block_size:
+        trim_count = block_size - accepted_count
+        if any(entry.trim(trim_count) != trim_count for entry in forked):
+            _finish_candidate(batch, candidate, cursor, cursor + accepted_count)
+            return False
 
     batch._speculative_base_cache = base_cache  # pyright: ignore[reportAttributeAccessIssue]
     batch._speculative_replay_tokens = [current]  # pyright: ignore[reportAttributeAccessIssue]
@@ -310,11 +361,81 @@ def _verify_next_draft_block(batch: GenerationBatch, inputs: mx.array) -> bool:
     # This path is gated off when the caller requests logprobs. Avoid retaining
     # one full vocabulary row per accepted token merely to discard it later.
     no_logprobs = mx.array([], dtype=mx.float32)
-    queue.extend((token, no_logprobs) for token in expected)
-    batch._speculative_cursor = cursor + block_size  # pyright: ignore[reportAttributeAccessIssue]
+    accepted_tokens = expected[:accepted_count]
+    queue.extend((token, no_logprobs) for token in accepted_tokens)
+    batch._speculative_cursor = cursor + accepted_count  # pyright: ignore[reportAttributeAccessIssue]
     accepted = cast(int, batch._speculative_accepted)  # pyright: ignore[reportAttributeAccessIssue]
-    batch._speculative_accepted = accepted + block_size  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_accepted = accepted + accepted_count  # pyright: ignore[reportAttributeAccessIssue]
+    if accepted_count < block_size:
+        _finish_candidate(
+            batch,
+            candidate,
+            cursor + accepted_count,
+            cursor + accepted_count,
+        )
     return True
+
+
+def _next_matching_candidate(
+    batch: GenerationBatch,
+    cursor: int,
+    current_token: int,
+) -> DraftCandidate | None:
+    candidates = cast(
+        list[DraftCandidate],
+        getattr(batch, "_speculative_candidates", []),
+    )
+    emitted = tuple(batch.tokens[0][-cursor:]) if cursor > 0 else ()
+    compatible: list[DraftCandidate] = []
+    for candidate in candidates:
+        if cursor >= len(candidate.tokens):
+            continue
+        if cursor > 0 and candidate.tokens[:cursor] != emitted:
+            continue
+        if cursor == 0 and candidate.tokens[0] != current_token:
+            continue
+        compatible.append(candidate)
+    candidates[:] = compatible[1:]
+    return compatible[0] if compatible else None
+
+
+def _finish_candidate(
+    batch: GenerationBatch,
+    candidate: DraftCandidate,
+    accepted_tokens: int,
+    mismatch: int | None,
+) -> None:
+    selection = cast(
+        DraftSelection | None,
+        getattr(batch, "_speculative_selection", None),
+    )
+    record = cast(
+        Callable[[DraftVerificationOutcome], None] | None,
+        getattr(batch, "_record_draft_outcome", None),
+    )
+    if selection is not None and record is not None:
+        record(
+            DraftVerificationOutcome(
+                selection_id=selection.selection_id,
+                candidate_id=candidate.candidate_id,
+                proposed_tokens=len(candidate.tokens),
+                accepted_tokens=accepted_tokens,
+                first_mismatch=mismatch,
+                selection_duration_ns=cast(
+                    int,
+                    getattr(batch, "_draft_selection_duration_ns", 0),
+                ),
+                verification_duration_ns=cast(
+                    int,
+                    getattr(batch, "_draft_verification_duration_ns", 0),
+                ),
+                verification_passes=cast(
+                    int,
+                    getattr(batch, "_draft_verification_passes", 0),
+                ),
+            )
+        )
+    batch._speculative_candidate = None  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _clear_speculative_rebase(batch: GenerationBatch) -> None:
@@ -349,8 +470,19 @@ def prepare_for_batch_extension(batch: GenerationBatch) -> None:
         return
     uids = cast(list[int] | None, getattr(batch, "uids", None))
     if uids is not None and not uids:
+        candidate = cast(
+            DraftCandidate | None,
+            getattr(batch, "_speculative_candidate", None),
+        )
+        if candidate is not None:
+            _finish_candidate(
+                batch,
+                candidate,
+                cast(int, getattr(batch, "_speculative_cursor", 0)),
+                None,
+            )
         batch._direct_generation = False  # pyright: ignore[reportAttributeAccessIssue]
-        batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+        batch._speculative_candidate = None  # pyright: ignore[reportAttributeAccessIssue]
         queue = cast(
             deque[tuple[int, mx.array]] | None,
             getattr(batch, "_speculative_queue", None),
@@ -381,6 +513,17 @@ def prepare_for_batch_extension(batch: GenerationBatch) -> None:
 def _rebase_speculative_batch(batch: GenerationBatch) -> None:
     """Discard ahead-of-output state before merging another request."""
     base_cache = cast(KVCacheType, batch._speculative_base_cache)  # pyright: ignore[reportAttributeAccessIssue]
+    candidate = cast(
+        DraftCandidate | None,
+        getattr(batch, "_speculative_candidate", None),
+    )
+    if candidate is not None:
+        _finish_candidate(
+            batch,
+            candidate,
+            cast(int, getattr(batch, "_speculative_cursor", 0)),
+            None,
+        )
     replay = cast(list[int], batch._speculative_replay_tokens)  # pyright: ignore[reportAttributeAccessIssue]
     forked = fork_kv_cache_for_append(
         base_cache,
@@ -407,7 +550,7 @@ def _rebase_speculative_batch(batch: GenerationBatch) -> None:
     batch.prompt_cache = forked
     batch._next_tokens = next_token
     batch._next_logprobs = logprobs
-    batch._speculative_draft = None  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_candidate = None  # pyright: ignore[reportAttributeAccessIssue]
     queue.clear()
     _clear_speculative_rebase(batch)
 

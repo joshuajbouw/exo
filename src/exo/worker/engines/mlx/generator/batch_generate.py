@@ -40,6 +40,12 @@ from exo.worker.engines.mlx.constants import (
     KV_GROUP_SIZE,
     MAX_TOKENS,
 )
+from exo.worker.engines.mlx.draft_selection import (
+    DraftCandidateSelector,
+    DraftSelection,
+    DraftVerificationOutcome,
+    exact_remembered_selection,
+)
 from exo.worker.engines.mlx.generator.generate import (
     append_only_continuation_tokens,
     ban_token_ids,
@@ -128,6 +134,7 @@ class ExoBatchGenerator:
     group: mx.distributed.Group | None
     kv_prefix_cache: KVPrefixCache | None
     vision_processor: VisionProcessor | None = None
+    draft_selector: DraftCandidateSelector | None = None
 
     _mlx_gen: MlxBatchGenerator = field(init=False)
     _detokenizer_prototype: StreamingDetokenizer = field(init=False, repr=False)
@@ -149,6 +156,69 @@ class ExoBatchGenerator:
         detokenizer = copy(self._detokenizer_prototype)
         detokenizer.reset()
         return detokenizer
+
+    def _record_draft_outcome(self, outcome: DraftVerificationOutcome) -> None:
+        """Return target-verified feedback without coupling generation to policy."""
+        if self.draft_selector is None:
+            return
+        try:
+            self.draft_selector.schedule_outcome(outcome)
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Draft feedback failed; generation result remains valid"
+            )
+
+    def _select_drafts(
+        self,
+        prompt_tokens: mx.array,
+    ) -> tuple[DraftSelection | None, int]:
+        assert self.kv_prefix_cache is not None
+        remembered = self.kv_prefix_cache.resolve_draft(prompt_tokens)
+        duration_ns = 0
+        if self.draft_selector is None:
+            selection = exact_remembered_selection(remembered)
+        else:
+            started = time.perf_counter_ns()
+            try:
+                selection = self.draft_selector.select(prompt_tokens, remembered)
+                duration_ns = time.perf_counter_ns() - started
+            except Exception:
+                duration_ns = time.perf_counter_ns() - started
+                logger.opt(exception=True).warning(
+                    "Draft selection failed; using ordinary generation"
+                )
+                return None, duration_ns
+
+        if selection is None:
+            return None, duration_ns
+        if not selection.selection_id:
+            logger.warning(
+                "Speculative selection has no identity; treating it as a miss"
+            )
+            return None, duration_ns
+        vocab_size = getattr(self.tokenizer, "vocab_size", None)
+        candidates = tuple(
+            candidate
+            for candidate in selection.candidates
+            if _draft_tokens_are_valid(DraftContinuation(candidate.tokens), vocab_size)
+        )
+        if len(candidates) != len(selection.candidates):
+            logger.warning(
+                "Speculative selection contains invalid token ids; "
+                "dropping invalid candidates"
+            )
+        if not candidates:
+            return None, duration_ns
+        candidate_ids = [candidate.candidate_id for candidate in candidates]
+        if any(not value for value in candidate_ids) or len(set(candidate_ids)) != len(
+            candidate_ids
+        ):
+            logger.warning(
+                "Speculative selection has missing or duplicate candidate "
+                "identities; treating it as a miss"
+            )
+            return None, duration_ns
+        return DraftSelection(selection.selection_id, candidates), duration_ns
 
     @property
     def has_work(self) -> bool:
@@ -277,24 +347,6 @@ class ExoBatchGenerator:
             eos_ids = eos_ids_from_tokenizer(self.tokenizer)
             logits_processors = [ban_token_ids(eos_ids)] + logits_processors
 
-        draft = None
-        if (
-            self.kv_prefix_cache is not None
-            and temperature == 0
-            and self.group is None
-            and vision is None
-            and not task_params.logprobs
-            and not logits_processors
-            and task_params.stop is None
-        ):
-            draft = self.kv_prefix_cache.resolve_draft(all_prompt_tokens)
-            vocab_size = getattr(self.tokenizer, "vocab_size", None)
-            if draft is not None and not _draft_tokens_are_valid(draft, vocab_size):
-                logger.warning(
-                    "Speculative draft contains invalid token ids; treating it as a miss"
-                )
-                draft = None
-
         max_tokens = task_params.max_output_tokens or MAX_TOKENS
         can_fuse_prefill = (
             self.group is None
@@ -307,6 +359,17 @@ class ExoBatchGenerator:
             and len(self._mlx_gen._prompt_batch) == 0
             and not self._mlx_gen._unprocessed_sequences
         )
+        draft_selection: DraftSelection | None = None
+        draft_selection_duration_ns = 0
+        if (
+            can_fuse_prefill
+            and self.kv_prefix_cache is not None
+            and temperature == 0
+            and task_params.stop is None
+        ):
+            draft_selection, draft_selection_duration_ns = self._select_drafts(
+                all_prompt_tokens
+            )
         if can_fuse_prefill:
             # Prefix lookup returned an isolated cache fork, so appending does
             # not mutate the retained frontier. Cache types such as
@@ -351,7 +414,9 @@ class ExoBatchGenerator:
                 logits_processors,
                 internals._default_state_machine,  # pyright: ignore[reportPrivateUsage]
                 max_tokens,
-                draft.tokens if draft is not None else None,
+                draft_selection,
+                self._record_draft_outcome,
+                draft_selection_duration_ns,
             )
             internals._generation_batch = primed  # pyright: ignore[reportPrivateUsage]
             self._active_tasks[uid] = _EngineTask(

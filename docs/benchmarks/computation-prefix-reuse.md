@@ -91,7 +91,10 @@ route was rejected.
 A completed greedy response is also retained as a proposal keyed by the exact
 prompt-token identity and runtime profile. On a later match, Exo forks the KV
 frontier copy-on-write, evaluates the remembered tokens as one target-model
-sequence, and returns them only if Gemma's logits verify the complete block.
+sequence, and returns only the longest prefix Gemma's logits verify. If a
+proposal diverges in the middle of a block, Exo trims the unverified suffix
+from the speculative KV fork before exposing the verified prefix, then resumes
+ordinary generation or tries the next compatible ranked branch.
 The draft is never an answer cache or authority. Corrupt metadata, unsupported
 cache layouts, an invalid token id, or a token mismatch becomes an ordinary
 generation fallback.
@@ -136,11 +139,52 @@ uv run bench/speculative_continuation.py /path/to/mlx-model \
 ```
 
 This first implementation indexes one most-recent branch per exact prompt. It
-does not yet retrieve approximate branches, learn a branch policy, or apply
-rejection-correct speculative sampling at nonzero temperature. Those are
-separate policy and sampling problems; target-model verification remains the
-authority in every case. Draft memory is bounded by the retained KV frontier
-count, durable publications coalesce by prompt identity, and the configured
+also exposes a provider-neutral selector contract for richer branch sources.
+A selector receives the device-resident prompt tokens and the exact remembered
+branch, and may return ranked content-addressed candidates. This is the seam
+for a GPU relation engine: it proposes and ranks; Gemma still verifies. The
+selector receives structured feedback containing accepted length, first
+mismatch, selection cost, verification cost, and verification-pass count. Its
+feedback method must enqueue rather than perform training on the token path.
+
+Candidate IDs must be unique within a selection. Missing identities, duplicate
+identities, invalid token IDs, selector failures, feedback failures, and unsafe
+cache rollback all fail to ordinary generation. The current Exo integration
+does not implement a Tensor Logic policy itself; it makes that policy an
+injectable consumer rather than embedding reasoning rules in the inference
+engine.
+
+To exercise partial-prefix salvage and ranked fallback against the real model:
+
+```bash
+uv run bench/speculative_continuation.py /path/to/mlx-model \
+  --tokens 128 --block-size 128 --mismatch-at 64
+
+uv run bench/speculative_continuation.py /path/to/mlx-model \
+  --tokens 128 --block-size 128 --mismatch-at 64 --ranked-fallback
+```
+
+On the same Gemma 4 31B / M2 Ultra rig, corrupting token 64 of a 128-token
+remembered branch still produced byte-identical output. Prefix salvage reused
+64 correct proposal tokens and reached 37.4 tok/s versus 25.6 ordinary
+(**1.46x**). Putting the exact branch second let Exo salvage the first 64,
+switch at the proven mismatch, and verify the remainder from the compatible
+branch at 88.6 tok/s (**3.47x**). The benchmark selector itself took about
+40 microseconds; the two target-model verification passes took 823 ms and
+500 ms. These are deliberately adversarial branch-selection measurements,
+not a claim about the not-yet-integrated Tensor Logic selector's hit rate or
+GPU contention.
+
+The exact-branch control on the same code reached 135.7 tok/s versus 25.6
+ordinary (**5.30x**), accepted all 127 speculative tokens, and remained
+byte-identical. The selector call took 32 microseconds, confirming that the new
+ranked-candidate seam did not regress the earlier exact-reuse result.
+
+Approximate branch retrieval, a learned selection policy, and
+rejection-correct speculative sampling at nonzero temperature remain separate
+policy and sampling problems; target-model verification remains the authority
+in every case. Draft memory is bounded by the retained KV frontier count,
+durable publications coalesce by prompt identity, and the configured
 computation-store path must be scoped to the intended sharing domain.
 
 Run the benchmark with:

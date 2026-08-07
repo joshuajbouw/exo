@@ -22,6 +22,11 @@ from exo.worker.engines.mlx.cache import (
     make_kv_cache,
 )
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
+from exo.worker.engines.mlx.draft_selection import (
+    DraftCandidate,
+    DraftSelection,
+    DraftVerificationOutcome,
+)
 from exo.worker.engines.mlx.generator.batch_generate import _draft_tokens_are_valid
 from exo.worker.engines.mlx.generator.generate import (
     append_only_continuation_tokens,
@@ -207,7 +212,7 @@ def test_completed_direct_batch_clears_before_next_insert():
     prepare_for_batch_extension(batch)
 
     assert not batch._direct_generation
-    assert batch._speculative_draft is None
+    assert batch._speculative_candidate is None
     assert not batch._speculative_queue
     assert batch._speculative_base_cache is None
 
@@ -256,7 +261,10 @@ class _IncrementingCacheModel:
         return mx.array([rows])
 
 
-def _speculative_batch(draft: tuple[int, ...]):
+def _speculative_batch(
+    draft: tuple[int, ...],
+    *alternates: tuple[int, ...],
+):
     cache = KVCache()
     state = mx.zeros((1, 1, 3, 1))
     cache.update_and_fetch(state, state)
@@ -265,7 +273,18 @@ def _speculative_batch(draft: tuple[int, ...]):
     batch._primed_response_pending = True
     batch._next_tokens = mx.array([draft[0]])
     batch._next_logprobs = mx.zeros((1, 16))
-    batch._speculative_draft = draft
+    candidates = [
+        DraftCandidate(f"candidate-{index}".encode(), tokens)
+        for index, tokens in enumerate((draft, *alternates))
+    ]
+    batch._speculative_selection = DraftSelection(b"selection", tuple(candidates))
+    batch._speculative_candidates = candidates
+    batch._speculative_candidate = None
+    batch._draft_outcomes: list[DraftVerificationOutcome] = []
+    batch._record_draft_outcome = batch._draft_outcomes.append
+    batch._draft_selection_duration_ns = 0
+    batch._draft_verification_duration_ns = 0
+    batch._draft_verification_passes = 0
     batch._speculative_cursor = 0
     batch._speculative_queue = deque()
     batch._speculative_base_cache = None
@@ -296,17 +315,70 @@ def test_greedy_draft_is_verified_in_one_block_without_mutating_base_cache():
     assert base_cache.offset == 3
     assert cache_length(batch.prompt_cache) == 6
 
+    batch.uids = []
+    prepare_for_batch_extension(batch)
+    assert len(batch._draft_outcomes) == 1
+    outcome = batch._draft_outcomes[0]
+    assert outcome.accepted_tokens == 4
+    assert outcome.first_mismatch is None
+    assert outcome.verification_passes == 1
 
-def test_mismatched_draft_is_discarded_before_any_token_is_returned():
+
+def test_matching_draft_prefix_is_salvaged_before_mismatch_falls_back():
     batch, _ = _speculative_batch((2, 3, 9, 10))
 
     assert _patched_step(batch)[0] == [2]
     batch._num_tokens[0] += 1
     assert _patched_step(batch)[0] == [3]
 
-    assert batch._speculative_draft is None
-    assert batch._speculative_accepted == 0
-    assert batch.model.calls == [[2, 3, 9], [2]]
+    assert batch._speculative_candidate is None
+    assert batch._speculative_accepted == 1
+    assert batch.model.calls == [[2, 3, 9]]
+    assert cache_length(batch.prompt_cache) == 4
+    assert len(batch._draft_outcomes) == 1
+    outcome = batch._draft_outcomes[0]
+    assert outcome.candidate_id == b"candidate-0"
+    assert outcome.proposed_tokens == 4
+    assert outcome.accepted_tokens == 2
+    assert outcome.first_mismatch == 2
+    assert outcome.verification_passes == 1
+    assert outcome.verification_duration_ns > 0
+
+
+def test_ranked_candidate_falls_through_after_zero_length_block_match():
+    batch, _ = _speculative_batch((2, 9, 10), (2, 3, 4, 5))
+
+    assert _patched_step(batch)[0] == [2]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [3]
+
+    assert batch._speculative_accepted == 3
+    assert batch.model.calls == [[2, 9], [2, 3, 4]]
+    assert len(batch._draft_outcomes) == 1
+    outcome = batch._draft_outcomes[0]
+    assert outcome.candidate_id == b"candidate-0"
+    assert outcome.proposed_tokens == 3
+    assert outcome.accepted_tokens == 1
+    assert outcome.first_mismatch == 1
+    assert outcome.verification_passes == 1
+
+
+def test_ranked_candidate_resumes_after_a_salvaged_prefix():
+    batch, _ = _speculative_batch((2, 3, 9, 10), (2, 3, 4, 5))
+
+    assert _patched_step(batch)[0] == [2]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [3]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [4]
+
+    assert batch._speculative_accepted == 3
+    assert batch.model.calls == [[2, 3, 9], [3, 4]]
+    assert [outcome.accepted_tokens for outcome in batch._draft_outcomes] == [2]
+
+    batch.uids = []
+    prepare_for_batch_extension(batch)
+    assert [outcome.accepted_tokens for outcome in batch._draft_outcomes] == [2, 4]
 
 
 def test_verified_ahead_cache_rebases_before_concurrent_insert():
