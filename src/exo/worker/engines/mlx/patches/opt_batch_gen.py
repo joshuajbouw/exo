@@ -18,11 +18,13 @@ from exo.worker.engines.mlx.draft_selection import (
 from exo.worker.engines.mlx.types import KVCacheType, Model
 
 _PRECOMPUTE_TOP_K = 20
-# The Gemma 4 MLX path remains byte-identical to serial greedy generation at
-# this size in the real-model matrix. Larger single passes crossed a numerical
-# divergence boundary and are deliberately not used by the production path.
+# Exact remembered Gemma 4 branches remained byte-identical to serial greedy
+# generation at this size in the measured matrix. Dynamic refills remain
+# opt-in because their wider trace matrix has not passed that equivalence gate.
 _SPECULATIVE_BLOCK_SIZE = 128
 _ORIGINAL_EXTRACT_CACHE = GenerationBatch.extract_cache
+
+DraftRefill = Callable[[tuple[int, ...]], tuple[DraftSelection | None, int]]
 
 
 class GenerationStateMachine(Protocol):
@@ -44,6 +46,7 @@ def make_primed_generation_batch(
     draft_selection: DraftSelection | None = None,
     record_draft_outcome: Callable[[DraftVerificationOutcome], None] | None = None,
     draft_selection_duration_ns: int = 0,
+    refill_drafts: DraftRefill | None = None,
 ) -> GenerationBatch:
     """Build a generation batch whose first token was sampled during prefill."""
     batch = GenerationBatch.__new__(GenerationBatch)
@@ -69,6 +72,7 @@ def make_primed_generation_batch(
     batch._speculative_candidate = None  # pyright: ignore[reportAttributeAccessIssue]
     batch._record_draft_outcome = record_draft_outcome  # pyright: ignore[reportAttributeAccessIssue]
     batch._draft_selection_duration_ns = draft_selection_duration_ns  # pyright: ignore[reportAttributeAccessIssue]
+    batch._refill_drafts = refill_drafts  # pyright: ignore[reportAttributeAccessIssue]
     batch._draft_verification_duration_ns = 0  # pyright: ignore[reportAttributeAccessIssue]
     batch._draft_verification_passes = 0  # pyright: ignore[reportAttributeAccessIssue]
     batch._speculative_cursor = 0  # pyright: ignore[reportAttributeAccessIssue]
@@ -247,9 +251,36 @@ def _direct_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     self._next_tokens = sampled
     self._next_logprobs = logprobs
     token_list = cast(list[int], sampled.tolist())
+    _refill_after_sample(self, token_list[0])
     for tokens, token in zip(self.tokens, token_list, strict=True):
         tokens.append(token)
     return token_list, list(logprobs)
+
+
+def _refill_after_sample(batch: GenerationBatch, sampled_token: int) -> None:
+    """Query the relation again after ordinary progress opens a new suffix."""
+
+    if getattr(batch, "_speculative_candidate", None) is not None:
+        return
+    candidates = cast(
+        list[DraftCandidate], getattr(batch, "_speculative_candidates", [])
+    )
+    if candidates:
+        return
+    refill = cast(DraftRefill | None, getattr(batch, "_refill_drafts", None))
+    if refill is None:
+        return
+    selection, duration_ns = refill((*batch.tokens[0], sampled_token))
+    if selection is None:
+        return
+    candidates.extend(selection.candidates)
+    batch._speculative_selection = selection  # pyright: ignore[reportAttributeAccessIssue]
+    batch._draft_selection_duration_ns = duration_ns  # pyright: ignore[reportAttributeAccessIssue]
+    candidate = candidates.pop(0)
+    batch._speculative_candidate = candidate  # pyright: ignore[reportAttributeAccessIssue]
+    batch._speculative_cursor = 0  # pyright: ignore[reportAttributeAccessIssue]
+    batch._draft_verification_duration_ns = 0  # pyright: ignore[reportAttributeAccessIssue]
+    batch._draft_verification_passes = 0  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _next_speculative_token(

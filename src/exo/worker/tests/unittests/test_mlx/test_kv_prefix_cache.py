@@ -381,6 +381,31 @@ def test_ranked_candidate_resumes_after_a_salvaged_prefix():
     assert [outcome.accepted_tokens for outcome in batch._draft_outcomes] == [2, 4]
 
 
+def test_selector_refills_after_ordinary_progress_opens_a_new_context():
+    batch, _ = _speculative_batch((2,))
+    selection = DraftSelection(
+        b"dynamic-selection",
+        (DraftCandidate(b"dynamic-candidate", (4, 5, 6)),),
+    )
+    observed_contexts: list[tuple[int, ...]] = []
+
+    def refill(context: tuple[int, ...]):
+        observed_contexts.append(context)
+        return selection, 17
+
+    batch._refill_drafts = refill
+
+    assert _patched_step(batch)[0] == [2]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [3]
+    batch._num_tokens[0] += 1
+    assert _patched_step(batch)[0] == [4]
+
+    assert observed_contexts == [(1, 2, 3)]
+    assert batch.model.calls == [[2], [3, 4, 5]]
+    assert batch._speculative_accepted == 3
+
+
 def test_verified_ahead_cache_rebases_before_concurrent_insert():
     batch, base_cache = _speculative_batch((2, 3, 4, 5))
 

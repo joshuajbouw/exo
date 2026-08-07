@@ -112,10 +112,12 @@ delivery through Exo's batch loop, and completion handling.
 | 128 tokens | 128 | 26.2 tok/s | 137.2 tok/s | **5.23x** | 127/127 |
 | 256 tokens | 128 | 26.4 tok/s | 147.2 tok/s | **5.58x** | 255/255 |
 
-Every optimized run emitted the exact same token sequence as ordinary greedy
-generation. A 256-token verification block crossed a Gemma/MLX numerical
-divergence boundary in this setup and correctly fell back, so production uses
-128-token blocks rather than assuming that larger is always safe or faster.
+Every exact-remembered-branch run in this matrix emitted the same token sequence
+as ordinary greedy generation. A 256-token verification block crossed a
+Gemma/MLX numerical divergence boundary in this setup and correctly fell back,
+so the exact-branch path uses 128-token blocks rather than assuming that larger
+is always safe or faster. The dynamic-selector results below show why this is a
+measured profile property, not a universal guarantee.
 
 The durable control destroyed the writer cache, flushed the KV frontier and
 draft, released the embedded store, and reopened a new persistence instance.
@@ -149,10 +151,34 @@ feedback method must enqueue rather than perform training on the token path.
 
 Candidate IDs must be unique within a selection. Missing identities, duplicate
 identities, invalid token IDs, selector failures, feedback failures, and unsafe
-cache rollback all fail to ordinary generation. The current Exo integration
-does not implement a Tensor Logic policy itself; it makes that policy an
-injectable consumer rather than embedding reasoning rules in the inference
-engine.
+cache rollback all fail to ordinary generation. Exo also includes an opt-in GPU
+Tensor Logic selector at that seam. Corpus rows are typed
+context-to-continuation facts. Their context entities remain in an MLX matrix,
+and T=0 selection is one batched contraction followed by a bounded host result.
+The live verified token stream is a second, ephemeral relation source: a GPU
+longest-suffix query recovers repeated structure without publishing it as
+durable fleet memory. Corpus identity binds the privacy domain, runtime profile,
+selector profile, source identities, contexts, and candidate tokens.
+
+Dynamic re-selection after ordinary progress is deliberately experimental and
+disabled by default. The real-trace gate found a serial-equivalence failure: on
+a held-out Astrid tool window, 32-token verification accepted 62 speculative
+tokens but diverged from serial greedy output at token 6 and slowed 22.999 tok/s
+to 12.696 tok/s. A 64-token matrix also diverged at block sizes 16, 8, and 4.
+The likely boundary is the adopted KV state from batched causal attention:
+candidate tokens are verified, but its floating-point cache state need not be
+bit-identical to serial cache construction. This is a failed gate, not a speed
+claim. The selector and telemetry are retained for research; runtime wiring
+must not enable dynamic refill until serial-equivalence is either proved for a
+runtime profile or the API explicitly adopts weaker numerical semantics.
+
+Reproduce that gate against an extracted trace with:
+
+```bash
+uv run bench/speculative_continuation.py /path/to/mlx-model \
+  --tokens 128 --block-size 32 --tensor-logic \
+  --trace-file /path/to/held-out-session.txt --trace-cut 507334
+```
 
 To exercise partial-prefix salvage and ranked fallback against the real model:
 

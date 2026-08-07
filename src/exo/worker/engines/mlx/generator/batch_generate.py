@@ -168,12 +168,22 @@ class ExoBatchGenerator:
                 "Draft feedback failed; generation result remains valid"
             )
 
+    def _refill_drafts(
+        self, context_tokens: tuple[int, ...]
+    ) -> tuple[DraftSelection | None, int]:
+        """Select again after ordinary decoding advances to a new context."""
+
+        return self._select_drafts(mx.array(context_tokens, dtype=mx.uint32))
+
     def _select_drafts(
         self,
         prompt_tokens: mx.array,
     ) -> tuple[DraftSelection | None, int]:
-        assert self.kv_prefix_cache is not None
-        remembered = self.kv_prefix_cache.resolve_draft(prompt_tokens)
+        remembered = (
+            self.kv_prefix_cache.resolve_draft(prompt_tokens)
+            if self.kv_prefix_cache is not None
+            else None
+        )
         duration_ns = 0
         if self.draft_selector is None:
             selection = exact_remembered_selection(remembered)
@@ -417,6 +427,10 @@ class ExoBatchGenerator:
                 draft_selection,
                 self._record_draft_outcome,
                 draft_selection_duration_ns,
+                self._refill_drafts
+                if self.draft_selector is not None
+                and self.draft_selector.supports_dynamic_refill
+                else None,
             )
             internals._generation_batch = primed  # pyright: ignore[reportPrivateUsage]
             self._active_tasks[uid] = _EngineTask(

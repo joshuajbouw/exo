@@ -62,6 +62,11 @@ class DraftCandidateSelector(Protocol):
     tokens already returned for the invocation.
     """
 
+    @property
+    def supports_dynamic_refill(self) -> bool:
+        """Whether this selector may be queried again during direct decoding."""
+        ...
+
     def select(
         self,
         prompt_tokens: mx.array,

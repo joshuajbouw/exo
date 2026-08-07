@@ -28,6 +28,11 @@ from exo.worker.engines.mlx.draft_selection import (
 )
 from exo.worker.engines.mlx.generator.batch_generate import ExoBatchGenerator
 from exo.worker.engines.mlx.patches import apply_mlx_patches, opt_batch_gen
+from exo.worker.engines.mlx.tensor_logic_drafts import (
+    TensorLogicDraftFact,
+    TensorLogicDraftProfile,
+    TensorLogicDraftSelector,
+)
 from exo.worker.engines.mlx.types import DraftContinuation
 from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 
@@ -39,6 +44,18 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--durable", action="store_true")
+    parser.add_argument(
+        "--trace-file",
+        type=Path,
+        help="Use a real trace window instead of the synthetic storage prompt",
+    )
+    parser.add_argument("--trace-cut", type=int)
+    parser.add_argument("--trace-window-chars", type=int, default=3000)
+    parser.add_argument(
+        "--tensor-logic",
+        action="store_true",
+        help="Use GPU relation and live-context candidate selection",
+    )
     parser.add_argument(
         "--mismatch-at",
         type=int,
@@ -57,6 +74,10 @@ class _BenchmarkSelector(DraftCandidateSelector):
         self._mismatch_at = mismatch_at
         self._ranked_fallback = ranked_fallback
         self.outcomes: list[DraftVerificationOutcome] = []
+
+    @property
+    def supports_dynamic_refill(self) -> bool:
+        return False
 
     @staticmethod
     def _candidate(tokens: tuple[int, ...], label: bytes) -> DraftCandidate:
@@ -150,20 +171,66 @@ def main() -> None:
         temperature=0.0,
         enable_thinking=False,
     )
-    prompt = apply_chat_template(tokenizer, task)
+    if args.trace_file is not None:
+        if args.trace_cut is None:
+            raise ValueError("--trace-cut is required with --trace-file")
+        trace = args.trace_file.read_text(errors="replace")
+        if not 0 < args.trace_cut <= len(trace):
+            raise ValueError("trace-cut is outside the trace")
+        prompt = trace[
+            max(0, args.trace_cut - args.trace_window_chars) : args.trace_cut
+        ]
+    else:
+        prompt = apply_chat_template(tokenizer, task)
     prefix_cache = KVPrefixCache(None)
-    selector = _BenchmarkSelector(args.mismatch_at, args.ranked_fallback)
+    if args.tensor_logic:
+        prompt_tokens = tuple(tokenizer.encode(prompt, add_special_tokens=False))
+        profile = TensorLogicDraftProfile(
+            context_tokens=32,
+            feature_dimension=512,
+            maximum_candidates=4,
+            maximum_live_candidates=1,
+            maximum_draft_tokens=args.block_size,
+            minimum_live_context_tokens=2,
+            minimum_similarity=0.999,
+        )
+        facts = tuple(
+            TensorLogicDraftFact(
+                b"benchmark-live-prompt",
+                prompt_tokens[index - profile.context_tokens : index],
+                prompt_tokens[index : index + profile.maximum_draft_tokens],
+            )
+            for index in range(
+                profile.context_tokens,
+                len(prompt_tokens) - 1,
+                4,
+            )
+            if len(prompt_tokens[index : index + profile.maximum_draft_tokens]) >= 2
+        )
+        if not facts:
+            raise ValueError("trace window is too short to build draft facts")
+        selector: DraftCandidateSelector = TensorLogicDraftSelector(
+            facts,
+            privacy_domain_id=b"benchmark-domain",
+            runtime_profile_id=b"gemma4-mlx-greedy-v1",
+            profile=profile,
+            enable_experimental_dynamic_refill=True,
+        )
+    else:
+        selector = _BenchmarkSelector(args.mismatch_at, args.ranked_fallback)
     batch = ExoBatchGenerator(
         model,
         tokenizer,
         None,
         prefix_cache,
-        draft_selector=selector,
     )
 
     cold = _run(batch, task, prompt, "resp-cold")
     prefix_cache._drafts.clear()
     ordinary = _run(batch, task, prompt, "resp-ordinary")
+    if args.tensor_logic:
+        prefix_cache._drafts.clear()
+    batch.draft_selector = selector
     speculative = _run(batch, task, prompt, "resp-speculative")
     generation_batch = batch._mlx_gen._generation_batch
     accepted = int(getattr(generation_batch, "_speculative_accepted", 0))
@@ -180,7 +247,12 @@ def main() -> None:
         "output_speedup": speculative["tokens_per_second"]
         / ordinary["tokens_per_second"],
         "verification_outcomes": [
-            _outcome_json(outcome) for outcome in selector.outcomes
+            _outcome_json(outcome)
+            for outcome in (
+                selector.drain_outcomes()
+                if isinstance(selector, TensorLogicDraftSelector)
+                else selector.outcomes
+            )
         ],
     }
     batch.close()
