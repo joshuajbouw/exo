@@ -78,6 +78,49 @@ MLX cache view. The live path instead forks the immutable response frontier
 copy-on-write: existing KV tensors remain shared until the multi-token append
 allocates its new state.
 
+### Growing conversation storage
+
+The growing-session harness closes the computation store after every turn and
+opens a new persistence instance for the next one. It therefore measures a
+durable conversation rather than an in-memory cache accidentally surviving the
+turn boundary. A three-turn smoke run at a 1,021-token initial prompt produced:
+
+| Turn | Prompt | Reused | TTFT | New frontier | Projection growth | Authoritative growth |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1,021 | 0 | 6.85 s | 1,023 tokens | 1.84 GB | 1.12 GB |
+| 1 | 1,055 | 1,023 | 0.48 s | 34 tokens | 925 MB | 242 MB |
+| 2 | 1,089 | 1,056 | 0.75 s | 35 tokens | 928 MB | 241 MB |
+
+Continuation reused 97% of each later prompt and cut TTFT by roughly an order
+of magnitude. The physical-growth result is unacceptable as a production
+format: each 34–35-token turn added about 1.17 GB, or 32–34 MB per new token.
+The generic content store removed roughly 74% of each new full checkpoint, but
+the disposable safetensors projection still duplicated about 925 MB and the
+rotating tensor layout manufactured about 241 MB of authoritative novelty.
+This establishes two separate requirements: projections need an
+operator-governed eviction budget, and checkpoints need a tensor-aware
+block/delta representation rather than repeated whole-cache files. Retention
+alone cannot solve the authoritative amplification.
+
+The tensor-overlap probe then compared the two completed frontier files using
+each cache entry's logical token interval rather than its physical ring-buffer
+position. All 60 layer overlaps were byte-exact. Of the 925,368,320 successor
+tensor bytes, 895,631,360 bytes (96.79%) already existed in the prior frontier;
+only 29,736,960 bytes (3.21%) were new tensor payload. The model had 50 rotating
+and 10 append-only KV layers. A range-addressed representation can therefore
+reduce this turn's authoritative payload from 242 MB toward 30 MB without
+approximation, compression, or numerical reconstruction.
+
+Run the growth harness with:
+
+```bash
+uv run bench/conversation_growth.py /path/to/mlx-model \
+  --initial-tokens 4096 --turns 4 --output-tokens 8
+
+uv run bench/checkpoint_delta_probe.py \
+  /path/to/base.safetensors /path/to/successor.safetensors
+```
+
 Exo's batch path now performs the short append and first-token selection in one
 model call. It returns that primed token without speculatively computing token
 two; the completed cache may trail the returned frontier by one identified
