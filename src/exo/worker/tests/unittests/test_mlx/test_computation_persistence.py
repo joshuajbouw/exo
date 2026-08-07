@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import Event
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from exo.worker.engines.mlx.cache import cache_length
 from exo.worker.engines.mlx.computation_persistence import (
@@ -115,6 +115,77 @@ def test_checkpoint_round_trips_through_storage(tmp_path: Path):
     assert mx.array_equal(restored.prompt_tokens, prompt)
     assert _FakeComputationStore.get_file_calls == 0
 
+    persistence.close()
+
+
+def test_checkpoint_delta_reconstructs_after_all_projections_are_evicted(
+    tmp_path: Path,
+):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    base_prompt = mx.array([1, 2, 3], dtype=mx.uint32)
+    successor_prompt = mx.array([1, 2, 3, 4, 5], dtype=mx.uint32)
+    cache = KVCache()
+    keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+    cache.update_and_fetch(keys, keys + 1)
+    persistence._store_checkpoint(base_prompt, [cache], 1.0)
+    appended = mx.arange(16).reshape(1, 2, 2, 4).astype(mx.float32) + 100
+    cache.update_and_fetch(appended, appended + 1)
+    mx.eval(cache.state)
+    persistence._store_checkpoint(successor_prompt, [cache], 1.0)
+
+    successor_id = _prefix_id("profile-a", successor_prompt)
+    metadata = persistence._read_metadata(successor_id)
+    assert metadata is not None
+    assert metadata.representation == "delta"
+    assert metadata.base_prefix_id == _prefix_id("profile-a", base_prompt)
+    assert len(metadata.delta_layers) == 1
+
+    for projection in (tmp_path / "store" / "projections").glob("*.safetensors"):
+        projection.unlink()
+    restored = persistence.restore_longest(successor_prompt, 0, [])
+
+    assert restored is not None
+    assert cache_length(restored.cache) == 5
+    assert mx.array_equal(restored.cache[0].state[0], cache.state[0])
+    assert mx.array_equal(restored.cache[0].state[1], cache.state[1])
+    assert _FakeComputationStore.get_file_calls == 2
+    persistence.close()
+
+
+def test_chained_rotating_deltas_reconstruct_canonical_projection(tmp_path: Path):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    cache = RotatingKVCache(max_size=4, keep=0)
+    for length in (4, 6, 8):
+        while cache.offset < length:
+            token = cache.offset
+            keys = mx.full((1, 1, 1, 2), token, dtype=mx.float32)
+            cache.update_and_fetch(keys, keys + 100)
+        prompt = mx.array(list(range(length)), dtype=mx.uint32)
+        persistence._store_checkpoint(prompt, [cache], 1.0)
+
+    for projection in (tmp_path / "store" / "projections").glob("*.safetensors"):
+        projection.unlink()
+    prompt = mx.array(list(range(8)), dtype=mx.uint32)
+    restored = persistence.restore_longest(prompt, 0, [])
+
+    assert restored is not None
+    assert cache_length(restored.cache) == 8
+    assert isinstance(restored.cache[0], RotatingKVCache)
+    expected_keys, expected_values = (
+        cache._temporal_order(cache.state[0]),
+        cache._temporal_order(cache.state[1]),
+    )
+    actual = restored.cache[0]
+    actual_keys, actual_values = (
+        actual._temporal_order(actual.state[0]),
+        actual._temporal_order(actual.state[1]),
+    )
+    assert mx.array_equal(actual_keys, expected_keys)
+    assert mx.array_equal(actual_values, expected_values)
     persistence.close()
 
 

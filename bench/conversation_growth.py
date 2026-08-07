@@ -34,6 +34,11 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--output-tokens", type=int, default=16)
     parser.add_argument(
+        "--evict-projections-between-turns",
+        action="store_true",
+        help="Force verified delta reconstruction on every continuation turn",
+    )
+    parser.add_argument(
         "--runtime-profile",
         default="gemma4-conversation-growth-v1",
     )
@@ -197,6 +202,9 @@ def _run(args: argparse.Namespace, store: Path) -> None:
         measurement["turn"] = index
         turns.append(measurement)
         previous_response_id = response_id
+        if args.evict_projections_between_turns and index + 1 < args.turns:
+            for projection in (store / "projections").glob("*.safetensors"):
+                projection.unlink()
         mx.clear_cache()
 
     for previous, current in zip(turns, turns[1:], strict=False):

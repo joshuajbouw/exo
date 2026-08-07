@@ -21,6 +21,11 @@ from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
 
 from exo.worker.engines.mlx.cache import cache_length
 from exo.worker.engines.mlx.cache_persistence import PersistedKVPrefix
+from exo.worker.engines.mlx.checkpoint_delta import (
+    CheckpointDeltaLayer,
+    prepare_checkpoint_delta,
+    restore_checkpoint_delta,
+)
 from exo.worker.engines.mlx.types import (
     ContinuationFrontier,
     DraftContinuation,
@@ -33,7 +38,7 @@ if TYPE_CHECKING:
     from exo.worker.engines.mlx.vision import MediaRegion
 
 
-_SCHEMA = 2
+_SCHEMA = 3
 _PREFIX_DOMAIN = b"exo-mlx-prefix-state-v1\0"
 
 
@@ -73,8 +78,12 @@ class _CheckpointMetadata(msgspec.Struct, frozen=True):
     schema: int
     runtime_profile: str
     prefix_id: str
+    representation: str
     content_object: str
+    content_digest: str
     projection_digest: str
+    base_prefix_id: str | None
+    delta_layers: tuple[CheckpointDeltaLayer, ...]
     token_count: int
     cache_tokens: int
     prefill_tps: float
@@ -182,52 +191,12 @@ class StoreKVPrefixPersistence:
                 metadata = self._read_metadata(prefix_id)
                 if metadata is None or metadata.token_count != token_count:
                     continue
-                projection = self._projection_path(metadata.content_object)
-                verification_seconds = 0.0
-                reconstruction_seconds = 0.0
-                if self._projection_available(projection):
-                    projection_digest = self._cached_projection_digest(projection)
-                    if projection_digest is None:
-                        started = time.perf_counter()
-                        before = self._projection_fingerprint(projection)
-                        projection_digest = self._store.digest_file(projection)
-                        after = self._projection_fingerprint(projection)
-                        verification_seconds = time.perf_counter() - started
-                        if before is None or before != after:
-                            projection_digest = "changed-during-verification"
-                        else:
-                            self._remember_verified_projection(
-                                projection,
-                                projection_digest,
-                                after,
-                            )
-                    if projection_digest != metadata.projection_digest:
-                        projection.unlink(missing_ok=True)
-                        self._forget_verified_projection(projection)
-                if not self._projection_available(projection):
-                    destination = self._temporary_path("restore", prefix_id)
-                    started = time.perf_counter()
-                    try:
-                        restored_identity = self._store.get_file(
-                            _content_name(self._profile_id, prefix_id), destination
-                        )
-                        if restored_identity is None:
-                            continue
-                        content_object, projection_digest = restored_identity
-                        if content_object != metadata.content_object:
-                            raise ValueError("checkpoint object identity mismatch")
-                        if projection_digest != metadata.projection_digest:
-                            raise ValueError(
-                                "checkpoint representation digest mismatch"
-                            )
-                        os.replace(destination, projection)
-                        self._remember_verified_projection(
-                            projection,
-                            projection_digest,
-                        )
-                    finally:
-                        destination.unlink(missing_ok=True)
-                    reconstruction_seconds = time.perf_counter() - started
+                restored_projection = self._restore_projection(metadata)
+                if restored_projection is None:
+                    continue
+                projection, verification_seconds, reconstruction_seconds = (
+                    restored_projection
+                )
                 started = time.perf_counter()
                 restored = cast(
                     KVCacheType,
@@ -530,26 +499,48 @@ class StoreKVPrefixPersistence:
 
     def _publish_checkpoint(self, checkpoint: _PreparedCheckpoint) -> None:
         source = checkpoint.source
+        delta_source: Path | None = None
         started = time.perf_counter()
         try:
-            content_object, projection_digest = self._store.put_file(
-                _content_name(self._profile_id, checkpoint.prefix_id), source
-            )
-            os.replace(source, self._projection_path(content_object))
+            prepared_delta = self._prepare_delta(checkpoint)
+            if prepared_delta is None:
+                representation = "full"
+                base_prefix_id = None
+                delta_layers: tuple[CheckpointDeltaLayer, ...] = ()
+                content_object, content_digest = self._store.put_file(
+                    _content_name(self._profile_id, checkpoint.prefix_id), source
+                )
+                projection_digest = content_digest
+            else:
+                delta_source, base_prefix_id, delta_layers = prepared_delta
+                representation = "delta"
+                projection_digest = self._store.digest_file(source)
+                content_object, content_digest = self._store.put_file(
+                    _content_name(self._profile_id, checkpoint.prefix_id),
+                    delta_source,
+                )
+            projection = self._projection_path(checkpoint.prefix_id)
+            os.replace(source, projection)
             self._remember_verified_projection(
-                self._projection_path(content_object),
+                projection,
                 projection_digest,
             )
         finally:
             source.unlink(missing_ok=True)
+            if delta_source is not None:
+                delta_source.unlink(missing_ok=True)
         admission_seconds = time.perf_counter() - started
         started = time.perf_counter()
         metadata = _CheckpointMetadata(
             schema=_SCHEMA,
             runtime_profile=self._profile_id,
             prefix_id=checkpoint.prefix_id,
+            representation=representation,
             content_object=content_object,
+            content_digest=content_digest,
             projection_digest=projection_digest,
+            base_prefix_id=base_prefix_id,
+            delta_layers=delta_layers,
             token_count=checkpoint.token_count,
             cache_tokens=checkpoint.cache_tokens,
             prefill_tps=checkpoint.prefill_tps,
@@ -583,11 +574,192 @@ class StoreKVPrefixPersistence:
                 ),
                 msgspec.json.encode(continuation),
             )
+        if base_prefix_id is not None:
+            self._evict_projection(base_prefix_id)
         self.last_publication_metrics = PublicationMetrics(
             mlx_serialization_seconds=checkpoint.serialization_seconds,
             store_admission_seconds=admission_seconds,
             metadata_publication_seconds=time.perf_counter() - started,
         )
+
+    def _prepare_delta(
+        self,
+        checkpoint: _PreparedCheckpoint,
+    ) -> tuple[Path, str, tuple[CheckpointDeltaLayer, ...]] | None:
+        try:
+            successor = cast(
+                KVCacheType,
+                cast(object, load_prompt_cache(str(checkpoint.source))),
+            )
+            for token_count in reversed(self._read_lengths()):
+                if token_count >= checkpoint.token_count:
+                    continue
+                base_prefix_id = _prefix_id_from_bytes(
+                    self._runtime_profile,
+                    token_count,
+                    checkpoint.prompt_tokens[: token_count * 4],
+                )
+                base_metadata = self._read_metadata(base_prefix_id)
+                if base_metadata is None or base_metadata.token_count != token_count:
+                    continue
+                restored = self._restore_projection(base_metadata)
+                if restored is None:
+                    continue
+                base_projection, _, _ = restored
+                base = cast(
+                    KVCacheType,
+                    cast(object, load_prompt_cache(str(base_projection))),
+                )
+                delta_source = self._temporary_path("delta", checkpoint.prefix_id)
+                try:
+                    prepared = prepare_checkpoint_delta(delta_source, base, successor)
+                    if prepared is None:
+                        delta_source.unlink(missing_ok=True)
+                        continue
+                    canonical_source = self._temporary_path(
+                        "canonical", checkpoint.prefix_id
+                    )
+                    try:
+                        canonical = restore_checkpoint_delta(
+                            delta_source,
+                            base,
+                            prepared.layers,
+                        )
+                        save_prompt_cache(
+                            str(canonical_source),
+                            list(canonical),  # pyright: ignore[reportArgumentType]
+                            {
+                                "schema": str(_SCHEMA),
+                                "runtime_profile": self._profile_id,
+                                "prefix_id": checkpoint.prefix_id,
+                            },
+                        )
+                        os.replace(canonical_source, checkpoint.source)
+                    finally:
+                        canonical_source.unlink(missing_ok=True)
+                    return delta_source, base_prefix_id, prepared.layers
+                except Exception:
+                    delta_source.unlink(missing_ok=True)
+                    raise
+        except Exception:
+            logger.opt(exception=True).warning(
+                "Checkpoint delta preparation failed; publishing a full checkpoint"
+            )
+        return None
+
+    def _restore_projection(
+        self,
+        metadata: _CheckpointMetadata,
+    ) -> tuple[Path, float, float] | None:
+        verification_seconds = 0.0
+        reconstruction_started = time.perf_counter()
+        chain: list[_CheckpointMetadata] = []
+        current = metadata
+        seen: set[str] = set()
+        while True:
+            if current.prefix_id in seen:
+                raise ValueError("checkpoint delta cycle")
+            seen.add(current.prefix_id)
+            projection = self._projection_path(current.prefix_id)
+            valid, elapsed = self._verify_projection(
+                projection, current.projection_digest
+            )
+            verification_seconds += elapsed
+            if valid:
+                break
+            if current.representation == "full":
+                if not self._fetch_content(current, projection):
+                    return None
+                break
+            chain.append(current)
+            if current.base_prefix_id is None:
+                raise ValueError("checkpoint delta has no base")
+            base = self._read_metadata(current.base_prefix_id)
+            if base is None or base.token_count >= current.token_count:
+                raise ValueError("checkpoint delta base is not a strict prefix")
+            current = base
+
+        for delta in reversed(chain):
+            base_projection = self._projection_path(cast(str, delta.base_prefix_id))
+            base_cache = cast(
+                KVCacheType,
+                cast(object, load_prompt_cache(str(base_projection))),
+            )
+            pack = self._temporary_path("delta-restore", delta.prefix_id)
+            destination = self._temporary_path("restore", delta.prefix_id)
+            try:
+                if not self._fetch_content(delta, pack, projection=False):
+                    return None
+                restored = restore_checkpoint_delta(
+                    pack, base_cache, delta.delta_layers
+                )
+                save_prompt_cache(
+                    str(destination),
+                    list(restored),  # pyright: ignore[reportArgumentType]
+                    {
+                        "schema": str(_SCHEMA),
+                        "runtime_profile": self._profile_id,
+                        "prefix_id": delta.prefix_id,
+                    },
+                )
+                digest = self._store.digest_file(destination)
+                if digest != delta.projection_digest:
+                    raise ValueError("reconstructed checkpoint digest mismatch")
+                projection = self._projection_path(delta.prefix_id)
+                os.replace(destination, projection)
+                self._remember_verified_projection(projection, digest)
+            finally:
+                pack.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+        return (
+            self._projection_path(metadata.prefix_id),
+            verification_seconds,
+            time.perf_counter() - reconstruction_started if chain else 0.0,
+        )
+
+    def _verify_projection(self, path: Path, expected: str) -> tuple[bool, float]:
+        if not self._projection_available(path):
+            return False, 0.0
+        digest = self._cached_projection_digest(path)
+        elapsed = 0.0
+        if digest is None:
+            started = time.perf_counter()
+            before = self._projection_fingerprint(path)
+            digest = self._store.digest_file(path)
+            after = self._projection_fingerprint(path)
+            elapsed = time.perf_counter() - started
+            if before is None or before != after:
+                digest = "changed-during-verification"
+            else:
+                self._remember_verified_projection(path, digest, after)
+        if digest == expected:
+            return True, elapsed
+        path.unlink(missing_ok=True)
+        self._forget_verified_projection(path)
+        return False, elapsed
+
+    def _fetch_content(
+        self,
+        metadata: _CheckpointMetadata,
+        destination: Path,
+        *,
+        projection: bool = True,
+    ) -> bool:
+        restored_identity = self._store.get_file(
+            _content_name(self._profile_id, metadata.prefix_id), destination
+        )
+        if restored_identity is None:
+            return False
+        content_object, content_digest = restored_identity
+        if content_object != metadata.content_object:
+            raise ValueError("checkpoint content object identity mismatch")
+        if content_digest != metadata.content_digest:
+            raise ValueError("checkpoint content representation digest mismatch")
+        if projection:
+            if content_digest != metadata.projection_digest:
+                raise ValueError("full checkpoint digest mismatch")
+            self._remember_verified_projection(destination, content_digest)
+        return True
 
     def _read_lengths(self) -> list[int]:
         encoded = self._store.get(_index_key(self._profile_id))
@@ -608,15 +780,25 @@ class StoreKVPrefixPersistence:
             or decoded.runtime_profile != self._profile_id
             or decoded.prefix_id != prefix_id
             or not _is_lower_hex(decoded.content_object, 64)
+            or not _is_representation_digest(decoded.content_digest)
             or not _is_representation_digest(decoded.projection_digest)
+            or decoded.representation not in {"full", "delta"}
+            or (decoded.representation == "full" and decoded.base_prefix_id is not None)
+            or (decoded.representation == "full" and decoded.delta_layers)
+            or (decoded.representation == "delta" and decoded.base_prefix_id is None)
+            or (decoded.representation == "delta" and not decoded.delta_layers)
         ):
             raise ValueError("prefix metadata identity mismatch")
+        if decoded.base_prefix_id is not None and not _is_lower_hex(
+            decoded.base_prefix_id, 64
+        ):
+            raise ValueError("checkpoint delta base identity mismatch")
         return decoded
 
-    def _projection_path(self, content_object: str) -> Path:
-        if not _is_lower_hex(content_object, 64):
-            raise ValueError("invalid checkpoint object identity")
-        return self._projections / f"{content_object}.safetensors"
+    def _projection_path(self, prefix_id: str) -> Path:
+        if not _is_lower_hex(prefix_id, 64):
+            raise ValueError("invalid checkpoint prefix identity")
+        return self._projections / f"{prefix_id}.safetensors"
 
     @staticmethod
     def _projection_available(projection: Path) -> bool:
@@ -668,6 +850,17 @@ class StoreKVPrefixPersistence:
     def _forget_verified_projection(self, projection: Path) -> None:
         with self._projection_lock:
             self._verified_projections.pop(projection, None)
+
+    def _evict_projection(self, prefix_id: str) -> None:
+        projection = self._projection_path(prefix_id)
+        try:
+            projection.unlink(missing_ok=True)
+        except OSError:
+            # A platform may temporarily prevent deletion while another reader
+            # has the file open. The projection is disposable; retaining it is
+            # a safe loss of economy and a later policy pass can retry.
+            return
+        self._forget_verified_projection(projection)
 
     def _temporary_path(self, operation: str, prefix_id: str) -> Path:
         descriptor, value = tempfile.mkstemp(

@@ -39,3 +39,11 @@ digest during the existing input pass. A later process hashes the projection
 against that digest before MLX opens it; a missing or modified projection is
 reconstructed from verified content. Projection corruption can therefore lose
 warmth, never computation correctness.
+
+MLX checkpoints use exact logical-tensor deltas when a verified shorter
+frontier is available. The delta pack stores only newly computed tensor tails;
+every inherited range must byte-compare against the base or publication falls
+back to a complete checkpoint. After a successor publishes, its reconstructible
+ancestor projection is evicted, retaining one warm projection per lineage leaf.
+Cold recovery verifies the base and every delta pack, rebuilds an ordinary MLX
+safetensors checkpoint, and checks its complete digest before inference.

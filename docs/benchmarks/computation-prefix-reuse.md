@@ -87,20 +87,32 @@ turn boundary. A three-turn smoke run at a 1,021-token initial prompt produced:
 
 | Turn | Prompt | Reused | TTFT | New frontier | Projection growth | Authoritative growth |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0 | 1,021 | 0 | 6.85 s | 1,023 tokens | 1.84 GB | 1.12 GB |
-| 1 | 1,055 | 1,023 | 0.48 s | 34 tokens | 925 MB | 242 MB |
-| 2 | 1,089 | 1,056 | 0.75 s | 35 tokens | 928 MB | 241 MB |
+| 0 | 1,021 | 0 | 6.96 s | 1,023 tokens | 922 MB | 935 MB |
+| 1 | 1,055 | 1,023 | 0.49 s | 34 tokens | +3.52 MB | +30.7 MB |
+| 2 | 1,089 | 1,056 | 0.72 s | 35 tokens | +2.79 MB | +31.7 MB |
 
 Continuation reused 97% of each later prompt and cut TTFT by roughly an order
-of magnitude. The physical-growth result is unacceptable as a production
-format: each 34–35-token turn added about 1.17 GB, or 32–34 MB per new token.
-The generic content store removed roughly 74% of each new full checkpoint, but
-the disposable safetensors projection still duplicated about 925 MB and the
-rotating tensor layout manufactured about 241 MB of authoritative novelty.
-This establishes two separate requirements: projections need an
-operator-governed eviction budget, and checkpoints need a tensor-aware
-block/delta representation rather than repeated whole-cache files. Retention
-alone cannot solve the authoritative amplification.
+of magnitude. Exact tensor deltas reduced later authoritative growth from the
+previous 239–242 MB to 30.7–31.7 MB (7.6–7.9x smaller). Store admission fell
+from roughly 5.4 seconds to 1.1–1.2 seconds (about 4.5x faster). The delta builder
+compares every inherited tensor range byte-for-byte; a mismatch or unsupported
+cache layout publishes a complete checkpoint instead. A cold restore fetches
+the verified base and delta packs, reconstructs ordinary MLX state, and checks
+the complete projection digest before use.
+
+The projection policy retains only leaf frontiers: after a verified successor
+and its metadata publish, the reconstructible ancestor projection is evicted.
+The normal linear session therefore keeps one warm projection instead of one
+per turn. Total physical growth in the two continuation turns was 34.3 and
+34.5 MB, including both authoritative data and the growing leaf projection.
+Branches remain separate leaves; a future operator budget decides which cold
+leaves lose warmth without affecting correctness.
+
+Forced projection eviction verified cold reconstruction across successive
+rotating-cache deltas. TTFT rose to 3.06 seconds with one missing delta
+generation and 4.06 seconds with two. That path is exact and fail-closed, but
+its roughly linear chain cost establishes the next representation task:
+cost-triggered flattening or materialization, not a fixed generation limit.
 
 The tensor-overlap probe then compared the two completed frontier files using
 each cache entry's logical token interval rather than its physical ring-buffer
@@ -116,6 +128,11 @@ Run the growth harness with:
 ```bash
 uv run bench/conversation_growth.py /path/to/mlx-model \
   --initial-tokens 4096 --turns 4 --output-tokens 8
+
+# Exercise cold reconstruction rather than retained projections.
+uv run bench/conversation_growth.py /path/to/mlx-model \
+  --initial-tokens 4096 --turns 4 --output-tokens 8 \
+  --evict-projections-between-turns
 
 uv run bench/checkpoint_delta_probe.py \
   /path/to/base.safetensors /path/to/successor.safetensors
