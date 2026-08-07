@@ -253,18 +253,32 @@ class KVPrefixCache:
         snapshots: list[CacheSnapshot] | None,
         media_regions: list["MediaRegion"],
         prefill_tps: float,
+        *,
+        thread_bound: bool = False,
     ) -> None:
         """Publish an accelerator checkpoint without coupling it to inference."""
         if self._persistence is None:
             return
         try:
-            self._persistence.schedule_store(
-                prompt_tokens,
-                cache,
-                snapshots,
-                media_regions,
-                prefill_tps,
+            schedule_thread_bound = getattr(
+                self._persistence, "schedule_store_thread_bound", None
             )
+            if thread_bound and schedule_thread_bound is not None:
+                schedule_thread_bound(
+                    prompt_tokens,
+                    cache,
+                    snapshots,
+                    media_regions,
+                    prefill_tps,
+                )
+            else:
+                self._persistence.schedule_store(
+                    prompt_tokens,
+                    cache,
+                    snapshots,
+                    media_regions,
+                    prefill_tps,
+                )
         except Exception:
             logger.opt(exception=True).warning(
                 "KV cache persistence failed; inference result remains valid"
@@ -311,6 +325,80 @@ class KVPrefixCache:
             prefill_tps,
         )
         logger.info(f"KV cache added: {len(prompt_tokens)} tokens")
+
+    def adopt_kv_cache(
+        self,
+        prompt_tokens: mx.array,
+        cache: KVCacheType,
+        ssm_snapshots: list[CacheSnapshot] | None = None,
+        media_regions: list["MediaRegion"] | None = None,
+        prefill_tps: float = 0.0,
+    ) -> int:
+        """Adopt a completed cache without copying it.
+
+        Ownership transfers to this prefix cache.  The caller must not mutate
+        ``cache`` after this call.  This is the completion-path counterpart to
+        :meth:`add_kv_cache`: MLX has already detached the cache from active
+        generation, so copying gigabytes of immutable state would add latency
+        without protecting another owner.
+        """
+        self._evict_if_needed()
+        self.prompts.append(prompt_tokens)
+        self.caches.append(cache)
+        self._snapshots.append(ssm_snapshots)
+        self._media_regions.append(media_regions or [])
+        self.prefill_tps.append(prefill_tps)
+        self._access_counter += 1
+        self._last_used.append(self._access_counter)
+        self._schedule_persistence(
+            self.prompts[-1],
+            self.caches[-1],
+            self._snapshots[-1],
+            list(self._media_regions[-1]),
+            prefill_tps,
+            thread_bound=True,
+        )
+        logger.info(f"KV cache adopted: {len(prompt_tokens)} tokens")
+        return len(self.prompts) - 1
+
+    def adopt_kv_cache_update(
+        self,
+        index: int,
+        prompt_tokens: mx.array,
+        cache: KVCacheType,
+        snapshots: list[CacheSnapshot] | None,
+        restore_pos: int,
+        media_regions: list["MediaRegion"] | None = None,
+        prefill_tps: float = 0.0,
+    ) -> None:
+        """Replace an entry with a completed cache, taking ownership directly."""
+        old_snapshots = self._snapshots[index]
+        merged: list[CacheSnapshot] = []
+        if old_snapshots:
+            merged = [
+                snapshot
+                for snapshot in old_snapshots
+                if snapshot.token_count <= restore_pos
+            ]
+        if snapshots:
+            merged.extend(snapshots)
+
+        self.prompts[index] = prompt_tokens
+        self.caches[index] = cache
+        self._snapshots[index] = merged or None
+        self._media_regions[index] = media_regions or []
+        self.prefill_tps[index] = prefill_tps
+        self._access_counter += 1
+        self._last_used[index] = self._access_counter
+        self._schedule_persistence(
+            self.prompts[index],
+            self.caches[index],
+            self._snapshots[index],
+            list(self._media_regions[index]),
+            prefill_tps,
+            thread_bound=True,
+        )
+        logger.info(f"KV cache adopted (index {index}): {len(prompt_tokens)} tokens")
 
     def update_kv_cache(
         self,

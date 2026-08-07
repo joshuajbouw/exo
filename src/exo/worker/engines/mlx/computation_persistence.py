@@ -29,7 +29,26 @@ if TYPE_CHECKING:
 
 _SCHEMA = 2
 _PREFIX_DOMAIN = b"exo-mlx-prefix-state-v1\0"
-type _PendingCheckpoint = tuple[mx.array, KVCacheType, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _LazyCheckpoint:
+    prompt_tokens: mx.array
+    cache: KVCacheType
+    prefill_tps: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCheckpoint:
+    source: Path
+    prefix_id: str
+    token_count: int
+    cache_tokens: int
+    prefill_tps: float
+    serialization_seconds: float
+
+
+type _PendingCheckpoint = _LazyCheckpoint | _PreparedCheckpoint
 
 
 class _CheckpointMetadata(msgspec.Struct, frozen=True):
@@ -194,8 +213,32 @@ class StoreKVPrefixPersistence:
             # Retain at most one waiting checkpoint. If generation advances
             # faster than storage, the newest frontier replaces stale queued
             # work instead of pinning every historical cache in RAM.
-            self._pending = (prompt_tokens, cache, prefill_tps)
+            self._replace_pending(_LazyCheckpoint(prompt_tokens, cache, prefill_tps))
             self._publication.notify()
+
+    def schedule_store_thread_bound(
+        self,
+        prompt_tokens: mx.array,
+        cache: KVCacheType,
+        snapshots: list["CacheSnapshot"] | None,
+        media_regions: list["MediaRegion"],
+        prefill_tps: float,
+    ) -> None:
+        """Capture generation-stream state before crossing a thread boundary."""
+        if media_regions:
+            return
+        prepared = self._prepare_checkpoint(prompt_tokens, cache, prefill_tps)
+        with self._publication:
+            if self._closing:
+                prepared.source.unlink(missing_ok=True)
+                return
+            self._replace_pending(prepared)
+            self._publication.notify()
+
+    def _replace_pending(self, checkpoint: _PendingCheckpoint) -> None:
+        if isinstance(self._pending, _PreparedCheckpoint):
+            self._pending.source.unlink(missing_ok=True)
+        self._pending = checkpoint
 
     def close(self) -> None:
         with self._publication:
@@ -210,10 +253,17 @@ class StoreKVPrefixPersistence:
                     self._publication.wait()
                 if self._pending is None:
                     return
-                prompt_tokens, cache, prefill_tps = self._pending
+                checkpoint = self._pending
                 self._pending = None
             try:
-                self._store_checkpoint(prompt_tokens, cache, prefill_tps)
+                if isinstance(checkpoint, _PreparedCheckpoint):
+                    self._publish_checkpoint(checkpoint)
+                else:
+                    self._store_checkpoint(
+                        checkpoint.prompt_tokens,
+                        checkpoint.cache,
+                        checkpoint.prefill_tps,
+                    )
             except Exception:
                 logger.opt(exception=True).warning(
                     "KV checkpoint publication failed; inference result remains valid"
@@ -225,24 +275,48 @@ class StoreKVPrefixPersistence:
         cache: KVCacheType,
         prefill_tps: float,
     ) -> None:
+        self._publish_checkpoint(
+            self._prepare_checkpoint(prompt_tokens, cache, prefill_tps)
+        )
+
+    def _prepare_checkpoint(
+        self,
+        prompt_tokens: mx.array,
+        cache: KVCacheType,
+        prefill_tps: float,
+    ) -> _PreparedCheckpoint:
         token_count = len(prompt_tokens)
         prefix_id = _prefix_id(self._runtime_profile, prompt_tokens)
         source = self._temporary_path("publish", prefix_id)
         started = time.perf_counter()
-        save_prompt_cache(
-            str(source),
-            list(cache),  # pyright: ignore[reportArgumentType]
-            {
-                "schema": str(_SCHEMA),
-                "runtime_profile": self._profile_id,
-                "prefix_id": prefix_id,
-            },
-        )
-        serialization_seconds = time.perf_counter() - started
+        try:
+            save_prompt_cache(
+                str(source),
+                list(cache),  # pyright: ignore[reportArgumentType]
+                {
+                    "schema": str(_SCHEMA),
+                    "runtime_profile": self._profile_id,
+                    "prefix_id": prefix_id,
+                },
+            )
+            return _PreparedCheckpoint(
+                source=source,
+                prefix_id=prefix_id,
+                token_count=token_count,
+                cache_tokens=cache_length(cache),
+                prefill_tps=prefill_tps,
+                serialization_seconds=time.perf_counter() - started,
+            )
+        except Exception:
+            source.unlink(missing_ok=True)
+            raise
+
+    def _publish_checkpoint(self, checkpoint: _PreparedCheckpoint) -> None:
+        source = checkpoint.source
         started = time.perf_counter()
         try:
             content_object, projection_digest = self._store.put_file(
-                _content_name(self._profile_id, prefix_id), source
+                _content_name(self._profile_id, checkpoint.prefix_id), source
             )
             os.replace(source, self._projection_path(content_object))
         finally:
@@ -252,28 +326,28 @@ class StoreKVPrefixPersistence:
         metadata = _CheckpointMetadata(
             schema=_SCHEMA,
             runtime_profile=self._profile_id,
-            prefix_id=prefix_id,
+            prefix_id=checkpoint.prefix_id,
             content_object=content_object,
             projection_digest=projection_digest,
-            token_count=token_count,
-            cache_tokens=cache_length(cache),
-            prefill_tps=prefill_tps,
+            token_count=checkpoint.token_count,
+            cache_tokens=checkpoint.cache_tokens,
+            prefill_tps=checkpoint.prefill_tps,
         )
         self._store.set(
-            _metadata_key(self._profile_id, prefix_id),
+            _metadata_key(self._profile_id, checkpoint.prefix_id),
             msgspec.json.encode(metadata),
         )
         with self._index_lock:
             lengths = self._read_lengths()
-            if token_count not in lengths:
-                lengths.append(token_count)
+            if checkpoint.token_count not in lengths:
+                lengths.append(checkpoint.token_count)
                 lengths.sort()
                 self._store.set(
                     _index_key(self._profile_id),
                     msgspec.json.encode(lengths),
                 )
         self.last_publication_metrics = PublicationMetrics(
-            mlx_serialization_seconds=serialization_seconds,
+            mlx_serialization_seconds=checkpoint.serialization_seconds,
             store_admission_seconds=admission_seconds,
             metadata_publication_seconds=time.perf_counter() - started,
         )

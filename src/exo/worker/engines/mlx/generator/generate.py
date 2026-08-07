@@ -705,6 +705,7 @@ def mlx_generate(
                 media_regions=media_regions,
                 prefill_tps=prefill_tps,
             )
+            matched_index = len(kv_prefix_cache.prompts) - 1
 
     # stream_generate starts from the last token
     last_token = prompt_tokens[-2:]
@@ -712,6 +713,7 @@ def mlx_generate(
     max_tokens = task.max_output_tokens or MAX_TOKENS
     accumulated_text = ""
     generated_text_parts: list[str] = []
+    generated_token_ids: list[int] = []
     generation_start_time = time.perf_counter()
     usage: Usage | None = None
     logger.info("Starting decode")
@@ -733,6 +735,7 @@ def mlx_generate(
         start=1,
     ):
         generated_text_parts.append(out.text)
+        generated_token_ids.append(out.token)
         accumulated_text += out.text
 
         # Check for stop sequences
@@ -807,6 +810,32 @@ def mlx_generate(
             )
         if on_generation_token is not None:
             on_generation_token()
+
+        # A text stop can end inside a token.  Only MLX-native completion owns
+        # an exact token frontier; retaining a partially hidden stop token
+        # would make a later continuation semantically different.
+        if is_done and out.finish_reason is not None and kv_prefix_cache is not None:
+            frontier_tokens = mx.concatenate(
+                [all_prompt_tokens, mx.array(generated_token_ids)]
+            )
+            if matched_index is None:
+                kv_prefix_cache.adopt_kv_cache(
+                    frontier_tokens,
+                    caches,
+                    cache_snapshots,
+                    media_regions=media_regions,
+                    prefill_tps=prefill_tps,
+                )
+            else:
+                kv_prefix_cache.adopt_kv_cache_update(
+                    matched_index,
+                    frontier_tokens,
+                    caches,
+                    snapshots=None,
+                    restore_pos=len(all_prompt_tokens),
+                    media_regions=media_regions,
+                    prefill_tps=prefill_tps,
+                )
 
         yield GenerationResponse(
             text=text,

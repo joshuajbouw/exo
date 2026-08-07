@@ -80,6 +80,7 @@ class _EngineTask:
     detokenizer: StreamingDetokenizer
     on_generation_token: Callable[[], None] | None = None
     generated_text_parts: list[str] = field(default_factory=list)
+    generated_token_ids: list[int] = field(default_factory=list)
     potential_stop_sequence_text: str = ""
     completion_tokens: int = 0
     generation_start_time: float = 0.0
@@ -268,7 +269,7 @@ class ExoBatchGenerator:
             min_prefix_hit_length = max(
                 1000, system_prompt_token_count(task_params, self.tokenizer)
             )
-            self._save_prefix_cache(
+            matched_index = self._save_prefix_cache(
                 all_prompt_tokens,
                 list(cache),
                 cache_snapshots,
@@ -369,6 +370,7 @@ class ExoBatchGenerator:
                     f"[bench] uid={response.uid} tok#{state.completion_tokens} {text!r} t={delta:.4f}s"
                 )
             state.generated_text_parts.append(text)
+            state.generated_token_ids.append(response.token)
             state.potential_stop_sequence_text += text
 
             finish_reason: FinishReason | None = cast(
@@ -462,6 +464,34 @@ class ExoBatchGenerator:
             )
 
             if is_done:
+                if (
+                    response.prompt_cache is not None
+                    and self.kv_prefix_cache is not None
+                    and (not task_params.bench or task_params.use_prefix_cache)
+                ):
+                    frontier_tokens = mx.concatenate(
+                        [
+                            state.all_prompt_tokens,
+                            mx.array(state.generated_token_ids),
+                        ]
+                    )
+                    if state.matched_index is None:
+                        self.kv_prefix_cache.adopt_kv_cache(
+                            frontier_tokens,
+                            response.prompt_cache,
+                            media_regions=state.media_regions,
+                            prefill_tps=state.prefill_tps,
+                        )
+                    else:
+                        self.kv_prefix_cache.adopt_kv_cache_update(
+                            state.matched_index,
+                            frontier_tokens,
+                            response.prompt_cache,
+                            snapshots=None,
+                            restore_pos=len(state.all_prompt_tokens),
+                            media_regions=state.media_regions,
+                            prefill_tps=state.prefill_tps,
+                        )
                 del self._active_tasks[response.uid]
             elif (
                 max_stop_len > 0
@@ -500,9 +530,9 @@ class ExoBatchGenerator:
         min_prefix_hit_length: int = 1000,
         media_regions: list[MediaRegion] | None = None,
         prefill_tps: float = 0.0,
-    ) -> None:
+    ) -> int | None:
         if self.kv_prefix_cache is None:
-            return
+            return matched_index
 
         try:
             hit_ratio = (
@@ -523,6 +553,7 @@ class ExoBatchGenerator:
                     media_regions=media_regions,
                     prefill_tps=prefill_tps,
                 )
+                return matched_index
             else:
                 self.kv_prefix_cache.add_kv_cache(
                     all_prompt_tokens,
@@ -531,5 +562,7 @@ class ExoBatchGenerator:
                     media_regions=media_regions,
                     prefill_tps=prefill_tps,
                 )
+                return len(self.kv_prefix_cache.prompts) - 1
         except Exception:
             logger.warning("Failed to save prefix cache", exc_info=True)
+            return matched_index

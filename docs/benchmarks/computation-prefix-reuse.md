@@ -46,6 +46,32 @@ store startup and retrieval dominate the tiny amount of avoided computation.
 The matrix shows the expected scaling: reuse becomes more valuable as avoided
 prefill grows while restore cost rises much more slowly.
 
+### Completed conversational turn
+
+The representative two-turn test retains the cache *after* the assistant
+finishes, destroys the in-memory cache, reopens the verified frontier, and
+appends the next user turn. For a 4,093-token Gemma prompt, the model answered
+`OK` in two tokens; both response tokens became part of the 4,095-token private
+frontier. The next user turn added 19 tokens.
+
+| Path | Median TTFT | Best TTFT | Versus cold |
+|---|---:|---:|---:|
+| Full cold replay | 24.668 s | — | 1x |
+| Standard MLX resumed generation | 0.449 s | 0.443 s | 54.9x |
+| One-call short-continuation prototype | **0.368 s** | **0.361 s** | **67.0x** |
+
+All samples produced the same first token as the cold replay. The durable path
+spent about 70–84 ms reopening and verifying the checkpoint; the remaining
+time evaluated the 19 new tokens. With the completed frontier still resident
+in memory, the one-call path avoids reopening as well.
+
+The one-call result is an optimization target rather than the current Exo
+generation path: it evaluates a short continuation and selects its first token
+in one model invocation. Exo and MLX currently split prefill from first-token
+selection, adding another model invocation. Splitting the vocabulary head from
+the transformer to project only the final hidden state was also measured and
+was slower, so that route was rejected.
+
 Run the benchmark with:
 
 ```bash
@@ -56,25 +82,35 @@ uv run bench/computation_prefix_reuse.py /path/to/mlx-model \
   --runtime-profile exact-model-closure-id
 ```
 
+Run the conversational benchmark with:
+
+```bash
+uv run bench/conversation_frontier_reuse.py /path/to/mlx-model \
+  --prefix-tokens 4096 \
+  --samples 5
+```
+
 ## Claim boundary
 
-The result demonstrates durable partial computation reuse. It does not make
-novel autoregressive decoding faster, and it does not yet memoize complete
-generation results. The current physical representation is an MLX safetensors
-checkpoint. A contiguous projection is a disposable accelerator: its BLAKE3
-digest is bound into authenticated checkpoint metadata, every process reopen
-verifies it, and a missing or changed projection is reconstructed from the
-authoritative store. The current backend converges identical and overlapping
-bytes, but tensor-aware block or delta representations are needed to minimize
-incremental storage for long growing sessions.
+The result demonstrates durable partial computation reuse, including the
+completed response frontier. It does not make novel autoregressive decoding
+free: the next user tokens and the next answer still require model evaluation.
+The current physical representation is an MLX safetensors checkpoint. A
+contiguous projection is a disposable accelerator: its BLAKE3 digest is bound
+into authenticated checkpoint metadata, every process reopen verifies it, and
+a missing or changed projection is reconstructed from the authoritative store.
+The current backend converges identical and overlapping bytes, but tensor-aware
+block or delta representations are needed to minimize incremental storage for
+long growing sessions.
 
 The benchmark continuation is token-prefix-stable by construction. Some
 stateless chat templates are not: they insert generation-only control tokens
 or remove private reasoning when rendering the next request. Reusing raw
-decode state across such a rewrite would change model semantics. Conserving a
-completed response across turns therefore requires a session/context assembler
-whose private token frontier is append-only; storage alone must not guess that
-equivalence.
+decode state across such a rewrite would change model semantics. The benchmark
+uses Gemma's explicit append contract for the second turn. General API use
+therefore still requires a session/context assembler whose private token
+frontier is append-only; storage alone must not guess that equivalence from a
+re-rendered human transcript.
 
 Checkpoint retention and physical reclamation remain operator policy. A
 production fleet must route those through its computation-sharing domain,

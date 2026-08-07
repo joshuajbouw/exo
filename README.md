@@ -365,7 +365,10 @@ See the [measured Gemma 4 benchmark](docs/benchmarks/computation-prefix-reuse.md
 for the end-to-end restart result and its claim boundaries. On an M2 Ultra, a
 16,384-token checkpoint reopened and verified in 0.141 seconds; adding 512 new
 tokens reached first output in 3.606 seconds versus 105.805 seconds cold, a
-29.34x end-to-end speedup with the same first token.
+29.34x end-to-end speedup with the same first token. In the measured two-turn
+conversation, Exo retained the completed assistant frontier and reopened it for
+the next 19-token user turn: median TTFT was 0.368 seconds versus 24.668 seconds
+for a cold replay, a 67.0x speedup with identical output.
 
 ---
 

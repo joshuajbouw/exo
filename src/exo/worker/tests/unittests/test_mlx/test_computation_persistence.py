@@ -221,6 +221,39 @@ def test_background_publication_failure_does_not_escape_close(tmp_path: Path):
     _FakeComputationStore.fail_put = False
 
 
+def test_thread_bound_checkpoint_is_serialized_before_worker_handoff(
+    tmp_path: Path, monkeypatch
+):
+    _install_fake_store()
+    _reset_fake_store()
+    persistence = StoreKVPrefixPersistence(tmp_path / "store", "profile-a")
+    prompt = mx.array([1, 2, 3, 4], dtype=mx.uint32)
+    cache = KVCache()
+    generation_stream = mx.new_stream(mx.gpu)
+    with mx.stream(generation_stream):
+        keys = mx.arange(24).reshape(1, 2, 3, 4).astype(mx.float32)
+        cache.update_and_fetch(keys, keys + 1)
+
+    import exo.worker.engines.mlx.computation_persistence as persistence_module
+
+    caller_thread = __import__("threading").get_ident()
+    serialization_threads: list[int] = []
+    original = persistence_module.save_prompt_cache
+
+    def recording_save(*args, **kwargs):
+        serialization_threads.append(__import__("threading").get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(persistence_module, "save_prompt_cache", recording_save)
+
+    persistence.schedule_store_thread_bound(prompt, [cache], None, [], 1.0)
+    assert serialization_threads == [caller_thread]
+    persistence.close()
+
+    restored = persistence.restore_longest(prompt, 0, [])
+    assert restored is not None
+
+
 def test_pending_publication_coalesces_to_latest_frontier(tmp_path: Path):
     _install_fake_store()
     _reset_fake_store()

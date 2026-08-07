@@ -143,6 +143,57 @@ class TestKVPrefix:
 
         assert persistence.stored == [(3, 123.0)]
 
+    def test_adopt_transfers_cache_without_copying(self, mock_tokenizer):
+        owned = [KVCache()]
+        cache = KVPrefixCache(None)
+
+        index = cache.adopt_kv_cache(mx.array([1, 2, 3]), owned)
+
+        assert index == 0
+        assert cache.caches[0] is owned
+
+    def test_adopt_update_transfers_cache_without_copying(self, mock_tokenizer):
+        cache = KVPrefixCache(None)
+        cache.add_kv_cache(mx.array([1, 2, 3]), [KVCache()])
+        completed = [KVCache()]
+
+        cache.adopt_kv_cache_update(
+            0,
+            mx.array([1, 2, 3, 4]),
+            completed,
+            snapshots=None,
+            restore_pos=3,
+        )
+
+        assert cache.caches[0] is completed
+        assert mx.array_equal(cache.prompts[0], mx.array([1, 2, 3, 4]))
+
+    def test_adopt_captures_thread_bound_state_before_publication(self):
+        class RecordingPersistence:
+            def __init__(self):
+                self.regular = 0
+                self.thread_bound = 0
+
+            def restore_longest(self, *args):
+                return None
+
+            def schedule_store(self, *args):
+                self.regular += 1
+
+            def schedule_store_thread_bound(self, *args):
+                self.thread_bound += 1
+
+            def close(self):
+                pass
+
+        persistence = RecordingPersistence()
+        cache = KVPrefixCache(None, persistence=persistence)  # type: ignore[arg-type]
+
+        cache.adopt_kv_cache(mx.array([1, 2, 3]), [KVCache()])
+
+        assert persistence.thread_bound == 1
+        assert persistence.regular == 0
+
     def test_restore_populates_memory_without_republishing(self, mock_tokenizer):
         class RestoringPersistence:
             def __init__(self):
@@ -226,9 +277,7 @@ class TestKVPrefix:
                 pass
 
         cache = KVPrefixCache(None, persistence=RestoringPersistence())  # type: ignore[arg-type]
-        with patch(
-            "exo.worker.engines.mlx.cache.has_non_kv_caches", return_value=True
-        ):
+        with patch("exo.worker.engines.mlx.cache.has_non_kv_caches", return_value=True):
             restored, remaining, matched_index, _ = cache.get_kv_cache(
                 object(),  # type: ignore[arg-type]
                 mx.array([1, 2, 3, 4]),
@@ -504,8 +553,8 @@ class TestKVPrefixCacheWithModel:
                 f"Failed on loop {i}"
             )
 
-    def test_mlx_generate_populates_cache(self, model_and_tokenizer):
-        """mlx_generate should save the post-prefill cache (before the decode loop)."""
+    def test_mlx_generate_populates_completed_frontier(self, model_and_tokenizer):
+        """mlx_generate should retain the prompt plus completed response tokens."""
         model, tokenizer = model_and_tokenizer
 
         kv_prefix_cache = KVPrefixCache(None)
@@ -530,10 +579,10 @@ class TestKVPrefixCacheWithModel:
 
         assert len(kv_prefix_cache.prompts) == 1
         assert len(kv_prefix_cache.caches) == 1
-        # add_kv_cache is called before the decode loop and stores a deepcopy of
-        # the cache as it is just after prefill + trim(2). Generation tokens are
-        # never written into the stored entry.
-        assert cache_length(kv_prefix_cache.caches[0]) == len(prompt_tokens) - 2
+        stored_tokens = kv_prefix_cache.prompts[0]
+        assert get_prefix_length(stored_tokens, prompt_tokens) == len(prompt_tokens)
+        assert len(stored_tokens) > len(prompt_tokens)
+        assert cache_length(kv_prefix_cache.caches[0]) == len(stored_tokens)
 
     def test_mlx_generate_second_call_gets_prefix_hit(self, model_and_tokenizer):
         """Second mlx_generate call with same prompt should get a prefix hit from stored cache."""
@@ -566,8 +615,8 @@ class TestKVPrefixCacheWithModel:
         result_cache, remaining_tokens, matched_index, _ = kv_prefix_cache.get_kv_cache(
             model, prompt_tokens
         )
-        # The stored cache is longer than the prompt (it includes generated tokens),
-        # so this is a prefix match where our prompt is fully contained
+        # The completed frontier is longer than the prompt, so the original
+        # request remains an exact prefix and can trim back to it.
         assert matched_index == 0
         # Exact match: remaining_tokens is just the last token and the one before
         assert len(remaining_tokens) == 2

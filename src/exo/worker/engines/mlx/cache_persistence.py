@@ -57,5 +57,15 @@ class KVPrefixPersistence(Protocol):
     ) -> None:
         """Schedule durable publication without delaying token generation."""
 
+    def schedule_store_thread_bound(
+        self,
+        prompt_tokens: mx.array,
+        cache: KVCacheType,
+        snapshots: list[CacheSnapshot] | None,
+        media_regions: list["MediaRegion"],
+        prefill_tps: float,
+    ) -> None:
+        """Capture thread-local accelerator state, then publish asynchronously."""
+
     def close(self) -> None:
         """Finish accepted publications and release backend resources."""
