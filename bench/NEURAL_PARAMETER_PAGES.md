@@ -415,6 +415,149 @@ experiment must compare a soft-prefix page and a residual steering page under
 the same fresh-process, unseen-form, inverted-proof, and collateral controls.
 Neither is allowed to carry the sole copy of a fact or proof.
 
+## Gemma 4 global-memory sidecar
+
+Inspection of the pinned Gemma 4 31B implementation identified a less noisy
+seam than ordinary prefix or residual injection. Its 60 layers contain ten
+full-attention layers (5, 11, ..., 59) among fifty sliding-window layers. The
+global layers use four 512-dimensional K/V heads with K=V at projection input.
+
+The sidecar gives those ten layers a second attention operation over a memory
+bank. It does not concatenate memory with conversational K/V:
+
+```text
+self = Attention(native_query, conversation_KV)
+memory = Attention(native_unrotated_query, proof_selected_memory_KV)
+output = native_o_proj(self + gate * memory)
+```
+
+The separate softmax prevents memory from competing with prompt length. The
+bank does not consume positions, alter RoPE offsets, or enter the rotating
+cache. An absent page skips the branch before query projection and must remain
+byte-identical to the unwrapped model.
+
+### Mechanical result
+
+On the real quantized model under MLX 0.32.0 / MLX-LM 0.31.3, a ten-slot page
+derived through Gemma's native K/V projections occupied 819,200 bytes and
+compiled in 204 ms. All ten global layers received memory while every ordinary
+cache offset remained exactly the three prompt tokens. Base, mounted-inactive,
+and revoked logits shared SHA-256
+`c0d4f6466e596c6b5e1a10e28fba168b5b3bdba7da076a4d6efe7b70cd84512f`;
+active logits changed to
+`1db8a9cb1f7b9b4cfee6a6e4e2666792562e6476a05ad986cabfc50d27b516dc`.
+
+An untrained semantic probe then compiled the private statement “code XQ-17
+maps to VELA” into nineteen native-projected slots. The active model produced
+nonsense rather than VELA. Native projection therefore satisfies geometry but
+not legibility: the sidecar needs a learned bridge, and arbitrary memory must
+not be admitted as if geometry alone supplied meaning.
+
+### Channel-capacity gate: pre-registration
+
+Before training a general compiler, optimize one direct memory bank while all
+Gemma weights remain frozen. This deliberately non-scalable test asks only
+whether the side channel can carry a readable signal:
+
+- one private Serevin fact, six training question forms, and two unseen forms;
+- direct K/V bank initialized from the native-projected private statement;
+- ten global layers, nineteen slots, fixed gate 1;
+- Adam, learning rate `1e-3`, 100 updates, deterministic order;
+- exact `VELA` generation on both unseen forms in a fresh evaluation pass;
+- page revocation restores the byte-identical base response; and
+- unrelated controls remain unchanged when the page is inactive.
+
+Failure rejects this sidecar equation before any compiler is built. Success
+proves only channel capacity. The direct bank is not persistent memory: the
+next gate must train one shared structured-fact compiler and freeze it before
+evaluating unseen facts.
+
+### Channel-capacity run 1: failed termination
+
+The direct bank reduced teacher-forced label loss from 14.3125 to zero by
+update 10 and retained zero loss through update 100. On both unseen forms the
+active model immediately emitted VELA, while the revoked model did not know
+the value. However, neither response was exactly `VELA`: both repeated the
+symbol because the training record supplied no end-of-turn target. The exact
+2/2 generation gate therefore failed. The page was 1,556,480 bytes with
+identity
+`12b4a6a48728f5cbabf466d8aca992d2566a980f2c8c116d1923936e2c946e44`.
+
+This establishes that the dedicated channel is legible but does not yet
+establish controlled realization. A single successor is registered before new
+evaluation: include the tokenizer's end-of-turn token in every answer target,
+retain the same fact, bank shape, six training forms, optimizer, learning
+rate, 100 updates, and strict exact-output bar, and replace both held-out forms
+with previously unseen wording. No other parameter changes.
+
+### Channel-capacity run 2: passed
+
+The termination-aware successor again reached zero teacher-forced loss by
+update 10. In the fixed final evaluation both new question forms generated
+exactly `VELA` and stopped; after revocation neither response contained the
+private value. Training took 98.04 seconds. The immutable 1,556,480-byte page
+has identity
+`b773bc4495bbdfbd6915881e3c65d89fcd21f13848e3b52a1d2b6db31f471913`.
+
+This proves that Gemma can read a dedicated global-attention memory bank. It
+does **not** prove scalable memory because that bank was optimized for one
+fact. The next claim is strictly harder: train one compiler over a registered
+fact population, freeze it, and compile unseen facts with no optimizer step.
+Per-fact tuning after the freeze is prohibited.
+
+### Shared compiler gate: pre-registration
+
+The first compiler test uses canonical key/relation/value records. It does not
+yet claim arbitrary Tensor Logic programs; it tests whether one frozen neural
+ABI can carry new members of a fixed typed relation:
+
+- 32 training facts and eight held-out facts with disjoint opaque keys;
+- eight value symbols, all represented in training, assigned independently of
+  key spelling;
+- canonical memory input
+  `SEREVIN_ENTRY(key=..., relation=MAPS_TO, value=...)`;
+- native-projected K/V followed by one shared rank-32 residual head transform
+  for keys and values at each of the ten global layers;
+- 655,360 trainable compiler parameters; Gemma remains frozen;
+- Adam, learning rate `1e-3`, 320 deterministic single-example updates;
+- four training question forms and two held-out forms;
+- compiler weights freeze before any held-out fact is compiled;
+- no optimizer step, gradient, or mutation after the freeze;
+- at least 14/16 exact value generations across the eight unseen facts and two
+  unseen forms; and
+- wrong-page activation must not reproduce the original fact's value on more
+  than two of eight first-form queries.
+
+Passing proves unseen *fact* compilation within one relation/value vocabulary.
+It does not yet prove unseen relations, concepts, composition, or a token-free
+Tensor Logic input. Those require later gates and must not be inferred from
+this result.
+
+### Shared compiler result: passed
+
+The rank-32 compiler reached zero training loss after the first 32-fact pass
+and remained stable through all 320 updates. Compiler weights were then frozen
+and serialized with SHA-256
+`c813a64cb1b50138d5e3a3eaf2e6bb9e5712e5a9881cdf851a0def301791eda9`.
+No held-out page had been supplied to the optimizer.
+
+All eight unseen facts generated their exact value under both unseen question
+forms: 16/16, exceeding the registered 14/16 bar. Deliberately activating a
+different fact's page reproduced the original fact's value 0/8 times. A fresh
+process then reloaded only the frozen compiler and registered corpus, compiled
+the eight facts again, reproduced all 16 page identities byte-for-byte, scored
+16/16 again, and retained the 0/8 wrong-page result. The frozen compiler has
+655,360 parameters; training took 318.12 seconds, while native projection of
+all 40 fact records took 9.62 seconds on the local M2 Ultra.
+
+This is evidence that one shared, frozen bridge can compile previously unseen
+facts into model-readable external memory with no per-fact optimization. The
+claim remains deliberately narrow: the relation and eight output values were
+represented during bridge training, and the compiler input was a canonical
+lexical record rather than a token-free Tensor Logic tensor. The next gate is
+therefore unseen relation/value composition from typed TL inputs—not a larger
+version of this same key/value corpus.
+
 This direction is supported, but not proven for Astrid, by prior work showing
 that learned continuous prefixes and soft prompts can condition frozen models
 with a small parameter fraction, and that activation additions can steer
