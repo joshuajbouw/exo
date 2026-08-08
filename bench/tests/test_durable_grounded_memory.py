@@ -20,6 +20,7 @@ from durable_grounded_memory import (
 )
 from gemma4_memory_sidecar_mlx import mount_memory_sidecar, save_memory_page
 from grounded_memory_selection import MemoryCatalogEntry
+from semantic_memory_invocation import SemanticRelationFact
 
 
 class _Backend:
@@ -105,6 +106,13 @@ def _publication(tmp_path: Path, token: int) -> PagePublication:
             last_epoch=100,
         ),
         source,
+        SemanticRelationFact(
+            "alpha",
+            "calibration-word-of",
+            f"device:{token}",
+            f"concept:{token}",
+            f"evidence:{token}",
+        ),
     )
 
 
@@ -122,6 +130,9 @@ def test_publish_reopens_verified_pages_and_advances_root_last(tmp_path: Path) -
         publication.entry.page_id for publication in publications
     }
     assert set(reopened.pages) == {entry.page_id for entry in reopened.entries}
+    assert reopened.relations == tuple(
+        sorted(publication.relation for publication in publications)
+    )
     assert "/manifest/" in backend.set_order[-2]
     assert backend.set_order[-1].endswith("/current")
 

@@ -10,6 +10,7 @@ from typing import Protocol, cast
 import msgspec
 from gemma4_memory_sidecar_mlx import MemoryPage, load_memory_page
 from grounded_memory_selection import MemoryCatalogEntry
+from semantic_memory_invocation import SemanticRelationFact
 
 _SCHEMA = 1
 _MANIFEST_DOMAIN = b"exo.durable-grounded-memory-manifest.v1\0"
@@ -33,6 +34,7 @@ class MemoryStoreBackend(Protocol):
 class PagePublication:
     entry: MemoryCatalogEntry
     source: Path
+    relation: SemanticRelationFact
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,7 @@ class ReopenedMemoryCatalog:
     manifest_id: str
     entries: tuple[MemoryCatalogEntry, ...]
     pages: dict[str, MemoryPage]
+    relations: tuple[SemanticRelationFact, ...]
 
 
 class _StoredEntry(msgspec.Struct, frozen=True):
@@ -60,6 +63,7 @@ class _Manifest(msgspec.Struct, frozen=True):
     schema: int
     privacy_domain_id: str
     entries: tuple[_StoredEntry, ...]
+    relations: tuple[SemanticRelationFact, ...]
 
 
 def _domain_key(privacy_domain_id: str) -> str:
@@ -123,6 +127,7 @@ class DurableGroundedMemoryStore:
             raise DurableMemoryError("catalog publication contains duplicate pages")
 
         stored_entries: list[_StoredEntry] = []
+        relations: list[SemanticRelationFact] = []
         for publication in ordered:
             entry = publication.entry
             if entry.privacy_domain_id != privacy_domain_id:
@@ -134,6 +139,14 @@ class DurableGroundedMemoryStore:
                 or page.runtime_profile != entry.runtime_profile
             ):
                 raise DurableMemoryError("catalog entry does not describe its page")
+            relation = publication.relation
+            if (
+                relation.privacy_domain_id != privacy_domain_id
+                or relation.concept_id != entry.concept_id
+                or relation.evidence_closure_id != entry.evidence_closure_id
+            ):
+                raise DurableMemoryError("catalog relation does not describe its entry")
+            relations.append(relation)
             content_name = _content_name(entry.page_id)
             object_id, digest = self._backend.put_file(content_name, publication.source)
             stored_entries.append(
@@ -152,7 +165,19 @@ class DurableGroundedMemoryStore:
                 )
             )
 
-        manifest = _Manifest(_SCHEMA, privacy_domain_id, tuple(stored_entries))
+        ordered_relations = tuple(sorted(relations))
+        relation_keys = {
+            (relation.relation_id, relation.subject_id)
+            for relation in ordered_relations
+        }
+        if len(relation_keys) != len(ordered_relations):
+            raise DurableMemoryError("catalog relation key is ambiguous")
+        manifest = _Manifest(
+            _SCHEMA,
+            privacy_domain_id,
+            tuple(stored_entries),
+            ordered_relations,
+        )
         encoded = msgspec.json.encode(manifest)
         manifest_id = _manifest_id(encoded)
         self._backend.set(_manifest_key(manifest_id), encoded)
@@ -192,6 +217,22 @@ class DurableGroundedMemoryStore:
             sorted(entry.page_id for entry in manifest.entries)
         ):
             raise DurableMemoryError("catalog manifest page order is non-canonical")
+        if manifest.relations != tuple(sorted(manifest.relations)):
+            raise DurableMemoryError("catalog relation order is non-canonical")
+        entry_evidence = {
+            (entry.concept_id, entry.evidence_closure_id) for entry in manifest.entries
+        }
+        relation_keys: set[tuple[str, str]] = set()
+        for relation in manifest.relations:
+            key = (relation.relation_id, relation.subject_id)
+            if (
+                relation.privacy_domain_id != privacy_domain_id
+                or (relation.concept_id, relation.evidence_closure_id)
+                not in entry_evidence
+                or key in relation_keys
+            ):
+                raise DurableMemoryError("catalog relation closure is invalid")
+            relation_keys.add(key)
 
         projection_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         entries: list[MemoryCatalogEntry] = []
@@ -220,4 +261,9 @@ class DurableGroundedMemoryStore:
                 raise DurableMemoryError("catalog manifest repeats a page")
             entries.append(entry)
             pages[page.page_id] = page
-        return ReopenedMemoryCatalog(manifest_id, tuple(entries), pages)
+        return ReopenedMemoryCatalog(
+            manifest_id,
+            tuple(entries),
+            pages,
+            manifest.relations,
+        )

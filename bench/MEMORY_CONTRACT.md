@@ -37,6 +37,13 @@ the current epoch. Huginn assembles the selected working set. Selection is an
 external deterministic operation with a canonical proof; it is not keyword
 matching, prompt guessing, or a learned router inside Gemma.
 
+Natural-language interpretation may supply an untrusted typed proposal before
+that operation. A proposal is not evidence and grants no authority. It must
+resolve against the current relation snapshot and then pass the same domain,
+capability, epoch, model, and runtime checks as any other request. The present
+bridge uses zero-page Gemma for this proposal step; Mimir-native learned
+grounding remains the intended replacement when its language gates are earned.
+
 The capability system authorizes access. Tensor Logic may propose and explain
 the selected set, but does not grant access. A selection proof binds the exact
 page identities it permits. A proof for one page cannot activate another.
@@ -103,6 +110,11 @@ The current evidence proves:
   death in Astrid's durable object store. A fresh reader with no source-artifact
   path reconstructed and identity-checked the closure before reproducing 16/16
   recall.
+- Starting from the current natural-language query rather than a supplied
+  concept id, zero-page Gemma proposed a typed relation and subject; the exact
+  grounder and selector then reproduced 16/16 durable recall. Eight unrelated,
+  missing, unknown, negated, quoted, meta-language, and prompt-injection
+  controls mounted no page.
 - Revocation restores the exact unpaged path.
 - Separately, native conversational K/V can survive process death and produce
   exact continuation. That is a hot-cache result only.
@@ -110,6 +122,8 @@ The current evidence proves:
 The current evidence does not prove:
 
 - deriving registered concept identities from arbitrary natural language;
+- general semantic grounding beyond the one registered operation, or that a
+  model proposal proves the meaning of an utterance;
 - unseen relation and vocabulary transfer at arbitrary scale;
 - compression or capacity beyond the measured pages;
 - safe simultaneous activation of arbitrary pages; or
@@ -145,6 +159,10 @@ the authority-bearing page selector.
   Astrid's computation-store adapter.
 - `evaluate_durable_grounded_memory.py`: two-process durable publication and
   latent-recall gate with no source-artifact path in the reader.
+- `semantic_memory_invocation.py`: canonical proposal decoding, durable
+  relation resolution, and query-bound grounding proofs.
+- `evaluate_semantic_grounded_memory.py`: zero-page language proposal through
+  durable relation grounding, capability selection, and latent recall.
 - `neural_parameter_pages.py`: capability-scoped deterministic page selection.
 - `native_kv_continuation_baseline.py`: exact hot-continuation control.
 - `NEURAL_PARAMETER_PAGES.md`: chronological experiment registrations and

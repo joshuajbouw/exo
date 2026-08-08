@@ -1077,13 +1077,13 @@ One writer process published the eight frozen latent pages and a canonical
 privacy-domain catalog through Astrid's computation-store adapter, then exited.
 A separately started reader received the model path and durable-store path but
 not the original page-artifact directory. It recovered manifest
-`d005a297de851cef4bda1224193ad93543b9f6c4d2a18dc870efaf28158d3615`,
+`7b1cf40d75cce241f7d55b9adb1fdebee1d4b8ba5f5aa2f250dc93c350754a7f`,
 verified every content object, physical digest, latent page identity, model id,
 and runtime profile, and reproduced 16/16 recall over the held-out natural
 questions.
 
-Publishing the eight pages and advancing the catalog root took 0.423 seconds.
-Verified reopen and projection took 0.088 seconds. The authoritative store used
+Publishing the eight pages and advancing the catalog root took 0.412 seconds.
+Verified reopen and projection took 0.089 seconds. The authoritative store used
 25,275,789 bytes for the roughly 24 MiB selected-page closure; the separate
 24 MiB projection is disposable compatibility state, not a second
 authoritative copy.
@@ -1100,6 +1100,83 @@ not close the remaining semantic boundary: the invocation still supplied the
 typed concept identity. Mapping arbitrary present-tense English and goals to
 grounded relations remains Mimir/Huginn work, not a function of the storage or
 latent-page mechanism.
+
+## Natural-language invocation grounding: pre-registration
+
+The next gate removes the caller-supplied concept identity without pretending
+that the current jar has already earned general English semantics. A zero-page
+Gemma invocation may propose one typed operation from the current user
+utterance and a fixed interface description. It receives no catalog, memory
+value, page, historical text, or historical K/V. The proposal is untrusted: an
+exact canonical decoder accepts only the registered operation and subject,
+Mimir's deterministic relation view resolves that pair to a concept identity,
+and the existing capability-scoped selector remains the only path to a page.
+
+This is deliberately proposal-and-verification, not a claim that a proof tree
+proves what English means. The grounding receipt proves which model proposal
+and relation snapshot caused the lookup. The measured semantic evidence is the
+held-out behavior and its negative controls; authorization remains mechanical.
+
+The fixed gate is:
+
+- the eight subject-to-concept relations are part of the durable catalog and
+  survive the same writer-process death as their pages;
+- a fresh, unpaged Gemma sees only the current query and the one-operation typed
+  interface, and emits a canonical lookup proposal;
+- the proposal is identity-bound to the exact query, invocation, relation
+  snapshot, and resulting concept before entering the existing selector;
+- all sixteen withheld natural queries derive the correct page and preserve
+  16/16 final recall after durable reopen;
+- unrelated predicates, missing subjects, unknown subjects, malformed output,
+  unknown operations, and ambiguous relation facts produce no mount;
+- the model never sees candidate concept identities or memory values while
+  proposing; and
+- source statements, source token ids, and historical conversational K/V remain
+  absent from both proposal and recall.
+
+Passing establishes a practical natural-language-to-typed-invocation bridge
+for this registered operation. It does not establish arbitrary ontology
+induction, jar-native learned English, general tool selection, or that the
+model's semantic proposal is an authorization fact. Those stronger claims stay
+behind their own evidence.
+
+### Natural-language invocation grounding result: passed
+
+After durable reopen, an unpaged Gemma process received each current query and
+only the fixed `private-calibration-word-of(subject_id)` interface. It saw no
+catalog entries, concept identities, page bytes, or memory values. For all
+sixteen withheld question forms it proposed the correct relation and subject.
+The canonical grounder resolved those proposals against the eight durable
+relation facts, bound each resolution to the exact query and relation-snapshot
+identity, and handed only the resulting concept to the independent capability
+selector. The mounted pages then reproduced 16/16 exact answers.
+
+Eight negative controls mounted zero pages: wrong predicate, absent subject,
+irrelevant request, unknown subject, explicit negation, quoted use/mention,
+meta-language, and a direct instruction to emit a valid-looking lookup. The
+first three and the adversarial language controls produced structural silence;
+the unknown subject produced a syntactically valid proposal that failed the
+relation join. Malformed, non-canonical, unknown-operation, ambiguous-relation,
+cross-domain, and unknown-subject paths are also pinned by unit tests.
+
+The durable manifest identity was
+`7b1cf40d75cce241f7d55b9adb1fdebee1d4b8ba5f5aa2f250dc93c350754a7f`;
+the eight-relation snapshot identity was
+`7b94a7bee16cf23020cd515fefac5289d775676666178b772fcaa1a1bc6db99f`,
+and the semantics-visible proposer profile was
+`bb6fd1107c0ce1b425d2f0a5f9f1d05cca3d7230d0048c6d0266ccfa83982786`.
+Publication took 0.412 seconds and verified reopen took 0.089 seconds. The
+sixteen sequential proposal-plus-recall paths took 117.2 seconds, making the
+extra model proposal pass—not storage, relation lookup, or page mounting—the
+obvious latency target.
+
+This is not word matching: the model interprets only the present utterance and
+a typed interface, while the exact layer resolves identities and authority. It
+is also not proof that English meaning is mechanically decidable. The
+grounding receipt proves which proposal and relation snapshot caused a lookup;
+the 16/16 and negative controls are the evidence that this frozen proposer
+understood this operation. General schemas, learned lexical acquisition, and
+Mimir-native parsing remain unproven.
 
 ## Stop conditions
 

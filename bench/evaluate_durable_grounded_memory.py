@@ -26,6 +26,7 @@ from grounded_memory_selection import (
 )
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
+from semantic_memory_invocation import SemanticRelationFact
 from train_gemma4_conversation_memory import (
     MODEL_ID,
     RUNTIME_PROFILE,
@@ -36,6 +37,7 @@ from train_gemma4_conversation_memory import (
 _DOMAIN = "durable-conversation-memory-domain"
 _PRINCIPAL = "durable-conversation-memory-principal"
 _EPOCH = 1_000_000_000
+_RELATION = "private-calibration-word-of"
 
 
 def _arguments() -> argparse.Namespace:
@@ -73,6 +75,17 @@ def _publish(artifact_dir: Path, workdir: Path) -> None:
                     last_epoch=2_000_000_000,
                 ),
                 source,
+                SemanticRelationFact(
+                    _DOMAIN,
+                    _RELATION,
+                    next(
+                        fact.entity
+                        for fact in facts()
+                        if fact.fact_id == record["fact_id"]
+                    ),
+                    _concept(record["fact_id"]),
+                    f"conversation-evidence:{record['fact_id']}",
+                ),
             )
         )
     store = DurableGroundedMemoryStore(workdir / "store")
