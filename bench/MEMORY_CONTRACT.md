@@ -4,6 +4,11 @@ Status: normative for the memory experiments in this repository. If an
 experiment, benchmark name, comment, or implementation conflicts with this
 document, this document wins until it is deliberately amended with evidence.
 
+Amendments are prospective. A contract change must land as a separate reviewed
+change before dependent implementation or measurement begins. An experiment
+may confirm or refute this contract; it may not relax the contract to make
+itself pass.
+
 ## The intended behavior
 
 A conversation may contain something worth remembering. Months and billions
@@ -121,6 +126,12 @@ the authority-bearing page selector.
 
 ## Implementation invariants
 
+- A strict natural-memory invocation gives the model its ordinary current
+  conversation only. Memory-specific operation descriptions, relation names,
+  candidate identities, catalogs, or routing instructions may not be added to
+  its prompt.
+- An experiment that supplies such an interface is a tool-routing control. It
+  cannot satisfy or weaken the grounded-memory claim, regardless of accuracy.
 - Production-style activation accepts a typed selection proof bound to the
   exact page id; an arbitrary proof string is insufficient.
 - The memory sidecar never performs retrieval or decides relevance.

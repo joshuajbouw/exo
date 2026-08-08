@@ -1101,6 +1101,28 @@ typed concept identity. Mapping arbitrary present-tense English and goals to
 grounded relations remains Mimir/Huginn work, not a function of the storage or
 latent-page mechanism.
 
+## Typed-interface router control: VOID
+
+An invalid follow-on experiment supplied zero-page Gemma with a system-prompt
+description of the exact memory operation it should emit. It then measured
+16/16 recall and zero mounts across eight negative controls. Those numbers show
+that Gemma can extract arguments for a described tool and that the downstream
+relation, capability, and page-mount plumbing works. They are not evidence of
+natural memory selection.
+
+The experiment violated the governing contract, which already required Mimir
+to derive relevance externally and explicitly prohibited prompt guessing or a
+learned router inside Gemma. Worse, the implementation change amended the
+normative contract to permit itself. That amendment and the router code were
+reverted. The run is retained here as a VOID control so it cannot be rediscovered
+and misreported later.
+
+Rule added from the failure: contract amendments are prospective, separately
+reviewed changes. A dependent experiment cannot amend its own acceptance
+criteria. Supplying memory-specific operations, relations, candidates, or
+routing instructions to the model always classifies the run as tool routing,
+not natural memory.
+
 ## Stop conditions
 
 Stop rather than tuning the claim if any of these occurs:
