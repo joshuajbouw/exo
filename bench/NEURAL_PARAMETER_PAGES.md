@@ -961,6 +961,84 @@ computation cache. Paging or quantization work must retain this path as its
 reference and fail-secure fallback, while latent-memory claims remain governed
 by the separate page-selection lifecycle.
 
+## Grounded latent-memory selection: pre-registration
+
+The passed conversation-latent run proved memory formation and recall but let
+the harness choose the page. The next gate connects that working channel to an
+external authoritative selector. It does not train Gemma, the writer, or a
+learned router.
+
+The fixed inputs are the frozen writer and sixteen held-out page artifacts from
+`gemma4-conversation-latent-memory-v1`, whose identities and 32/32 selected-page
+recall are already recorded above. One statement-form page per held-out memory
+is registered in an authoritative catalog with its evidence closure, privacy
+domain, concept identity, and epoch interval. The original statements, token
+ids, and conversational K/V remain absent from recall.
+
+The selector consumes only canonical ground facts and an invocation contract:
+principal, privacy domain, requested concept identity, current epoch, grants,
+and registered page service. Natural-language query bytes and Gemma hidden
+states are not selector inputs. The request's concept identity is typed
+invocation metadata supplied by the calling reasoning layer; deriving that
+identity from arbitrary English is explicitly outside this gate.
+
+The acceptance bar is:
+
+- in a fresh Gemma process, deterministic selection produces a canonical proof
+  bound to exactly one page and the fact-snapshot identity;
+- mounting that proof-selected page scores 16/16 exact over eight unseen
+  memories and both withheld natural-language question forms;
+- asking each natural-language question while deliberately requesting another
+  concept reproduces the original value at most twice in eight cases;
+- removing the grant, changing the privacy domain, or querying outside the
+  page's epoch produces no selection and no mount;
+- substituting any other page under a valid proof fails before model execution;
+  and
+- adding 100,000 unrelated catalog entries leaves the selected page unchanged;
+  the proof must change because it correctly binds the enlarged fact snapshot,
+  demonstrating that intervening corpus size is not model context without
+  pretending the evidence universe stayed identical.
+
+Passing establishes the end-to-end boundary in `MEMORY_CONTRACT.md`: ordinary
+conversation to latent page, authoritative external selection, page-bound
+proof, and fresh-process recall. It does not establish general English
+grounding, arbitrary relation transfer, or billion-entry storage performance.
+Failure does not reopen internal bank routing or native-K/V substitution.
+
+### Grounded latent-memory selection result: passed
+
+The frozen conversation pages were evaluated without retraining in a fresh
+Gemma process. A deterministic selector built one authenticated snapshot over
+the eight registered memories and 100,000 unrelated catalog entries, then
+selected pages through privacy-domain membership, explicit grants, typed
+concept identity, model/runtime compatibility, and epoch validity.
+
+The proof-selected pages scored 16/16 exact across all eight held-out memories
+and both unseen natural-language question forms. Deliberately requesting a
+different concept reproduced the original queried value 0/8 times. Revoked,
+cross-domain, and expired requests all produced no selection. Attempting to
+mount another page under a valid proof was rejected before model execution.
+Every expanded-catalog selection named the same page as the eight-entry
+baseline while correctly carrying a different fact-snapshot and proof identity.
+
+Constructing, indexing, and hashing the 100,008-entry catalog took 0.666 seconds
+on the local M2 Ultra. Once built, median selection took 36.5 microseconds and
+the maximum of the sixteen measured selections was 42.0 microseconds. No source
+statement, source token id, or historical K/V was supplied to recall. This is
+the first end-to-end evidence for the normative architecture: natural
+conversation became durable latent state; an external grounded relation
+selected it much later from a large unrelated corpus; a page-bound proof
+controlled mounting; and fresh Gemma recalled the memory.
+
+The claim boundary remains important. The invocation supplied the registered
+concept identity as typed metadata. This result does not show arbitrary English
+being converted into that identity; that is the next Mimir/Huginn grounding
+gate. It does show that once grounded, corpus size and elapsed epoch do not
+consume model context or require Gemma to become its own memory router.
+The evaluated catalog was an in-process canonical view over verified page
+artifacts; publishing the same records through Astrid's durable object store is
+integration work, not a property established by this run.
+
 ## Stop conditions
 
 Stop rather than tuning the claim if any of these occurs:

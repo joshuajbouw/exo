@@ -94,13 +94,18 @@ The current evidence proves:
 - With the correct externally selected page mounted, a fresh Gemma process
   recalled 32/32 held-out memories without source text, source token ids, or
   ordinary K/V.
+- The grounded selector then closed the integration boundary: with 100,000
+  unrelated catalog entries present, page-bound proofs selected the same eight
+  memories and fresh Gemma recalled 16/16 withheld natural-language queries.
+  Wrong concepts, revoked grants, domain mismatch, expired epochs, and page
+  substitution all failed safely.
 - Revocation restores the exact unpaged path.
 - Separately, native conversational K/V can survive process death and produce
   exact continuation. That is a hot-cache result only.
 
 The current evidence does not prove:
 
-- grounded natural-language selection across a lifetime corpus;
+- deriving registered concept identities from arbitrary natural language;
 - unseen relation and vocabulary transfer at arbitrary scale;
 - compression or capacity beyond the measured pages;
 - safe simultaneous activation of arbitrary pages; or
@@ -126,8 +131,12 @@ the authority-bearing page selector.
 ## Code map
 
 - `gemma4_memory_sidecar_mlx.py`: latent-page representation and mounting seam.
+- `grounded_memory_selection.py`: deterministic catalog, capability, epoch, and
+  page-bound proof derivation.
 - `train_gemma4_conversation_memory.py`: frozen writer and held-out page capture.
 - `evaluate_gemma4_conversation_memory.py`: fresh-process latent recall.
+- `evaluate_grounded_conversation_memory.py`: end-to-end authoritative
+  selection and fresh-process recall with unrelated-corpus controls.
 - `neural_parameter_pages.py`: capability-scoped deterministic page selection.
 - `native_kv_continuation_baseline.py`: exact hot-continuation control.
 - `NEURAL_PARAMETER_PAGES.md`: chronological experiment registrations and

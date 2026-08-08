@@ -21,6 +21,7 @@ from gemma4_memory_sidecar_mlx import (
     mount_memory_sidecar,
     save_memory_page,
 )
+from grounded_memory_selection import MemorySelectionError
 from mlx_lm.models.gemma4_text import Model, ModelArgs
 
 
@@ -114,7 +115,7 @@ def test_activation_requires_matching_identity_and_proof() -> None:
                 page.page_id,
             ),
         )
-    except MemorySidecarError as error:
+    except MemorySelectionError as error:
         assert "proof identity" in str(error)
     else:
         raise AssertionError("empty proof unexpectedly activated a memory page")

@@ -19,6 +19,7 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from grounded_memory_selection import MemorySelectionProof
 
 
 class MemorySidecarError(ValueError):
@@ -49,33 +50,6 @@ class MemoryPage:
     @property
     def resident_bytes(self) -> int:
         return sum(layer.resident_bytes for layer in self.layers)
-
-
-@dataclass(frozen=True, slots=True)
-class MemorySelectionProof:
-    """Grounded external selection bound to exactly one mounted page."""
-
-    proof_id: str
-    fact_snapshot_id: str
-    selected_page_id: str
-
-    def __post_init__(self) -> None:
-        if not self.proof_id:
-            raise MemorySidecarError("memory selection proof identity is empty")
-        if not self.fact_snapshot_id:
-            raise MemorySidecarError("memory selection fact snapshot is empty")
-        if not self.selected_page_id:
-            raise MemorySidecarError("memory selection has no page identity")
-
-    @classmethod
-    def for_page(
-        cls,
-        page: MemoryPage,
-        *,
-        proof_id: str,
-        fact_snapshot_id: str,
-    ) -> MemorySelectionProof:
-        return cls(proof_id, fact_snapshot_id, page.page_id)
 
 
 def save_memory_page(page: MemoryPage, path: Path) -> None:
