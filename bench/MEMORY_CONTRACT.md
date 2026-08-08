@@ -145,6 +145,8 @@ the authority-bearing page selector.
 
 ## Code map
 
+- `LATENT_MEMORY_RESULT.md`: formal statement of the demonstrated mechanism,
+  protocol, measurements, controls, and claim boundary.
 - `src/exo/worker/engines/mlx/latent_memory.py`: production adoption of the
   proven page format, identity checks, Gemma 4 attention mount, and exclusive
   invocation scope. The inactive path does not alter model input.
