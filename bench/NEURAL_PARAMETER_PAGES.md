@@ -558,6 +558,232 @@ lexical record rather than a token-free Tensor Logic tensor. The next gate is
 therefore unseen relation/value composition from typed TL inputs—not a larger
 version of this same key/value corpus.
 
+## Conversation-latent memory gate: pre-registration
+
+The canonical-record experiment does not establish ordinary memory formation.
+It begins with an interpretation that another component has already written
+down. The next experiment removes that component. Gemma reads an ordinary user
+turn, and the writer consumes only the native hidden states produced by that
+forward pass. No tool call, extracted triple, canonical restatement, or
+optimizer step is permitted for a held-out memory.
+
+The fixed experiment is:
+
+- 32 training conversations and eight held-out conversations, with disjoint
+  invented entity names;
+- one stable relation and eight opaque values, all values represented in the
+  training split, so the experiment tests new memories rather than new output
+  vocabulary;
+- four balanced training statement forms and two statement forms withheld in
+  full until evaluation;
+- four training question forms and two question forms withheld in full until
+  evaluation;
+- the memory source is the full-attention-layer activation trace produced when
+  Gemma reads the ordinary user turn through its normal chat template;
+- one shared rank-32 residual writer over the ten global-layer K/V projections,
+  trained for 320 deterministic single-example updates with Adam at `1e-3`;
+- Gemma remains frozen, and writer weights freeze before any held-out
+  conversation is captured;
+- each held-out page is serialized, the originating tokens and ordinary KV
+  cache are discarded, and a separate process loads only the unchanged Gemma,
+  frozen writer identity, serialized latent page, and a new question;
+- at least 28/32 exact generations over eight unseen conversations, two unseen
+  statement forms, and two unseen question forms;
+- the unpaged model may produce the private value for no more than two of eight
+  first-form questions;
+- a deliberately wrong page may produce the queried conversation's original
+  value for no more than two of eight first-form questions; and
+- revocation restores the unpaged deterministic response.
+
+Passing establishes a narrow but materially different claim: a shared frozen
+writer can preserve Gemma's own internal response to a previously unseen
+ordinary conversation and make it usable after process death without replaying
+the conversation into the new context. It does not establish autonomous
+selection, lifetime-scale capacity, temporal reasoning, arbitrary relations,
+or a model-independent memory representation. The source turn and its receipt
+remain authoritative; the neural page is disposable derived state.
+
+### Conversation-latent memory result: passed
+
+The shared writer reached zero calibration loss after the first 32-conversation
+pass and remained there through the registered 320 updates. Gemma stayed
+frozen. The writer has 655,360 parameters, serialized to 2.5 MiB, with SHA-256
+`1c629ac8eeff1000f2a3c1b09f64267ecef284247dfc9c0fcbdb31d1c0d7d718`.
+Training took 319.60 seconds on the local M2 Ultra.
+
+After the freeze, the writer captured both withheld statement forms for each
+of eight unseen fictional instruments. With the originating turn absent from
+the inference prompt, those pages produced the exact private value on all
+32 combinations of unseen statement and question forms. The unpaged model
+produced 0/8 private values, deliberately wrong pages produced 0/8 original
+values, and all eight revoked executions reproduced their corresponding
+unpaged response.
+
+A separate Python process then loaded a new Gemma instance and the 16 serialized
+pages. It did not load the originating statements, token ids, ordinary KV cache,
+or writer weights into inference. All 16 page identities reproduced, the replay
+again scored 32/32 exact, and the wrong-page control remained 0/8. The case
+registry has SHA-256
+`85e24c89fa50544261e653b7e190c354860a82f2d84f2b90e447ebe20d7197b1`.
+Each page contains only 20 K/V tensors plus model/profile/layer identity
+metadata; a literal-string scan found none of the entity, value, or statement
+text.
+
+The initial same-context diagnostic recorded 0/16 because its 16-token output
+limit cut Gemma 4 off inside its emitted thought channel before the final
+answer. This diagnostic was not an acceptance gate. Re-running it after the
+result with a 128-token limit and extracting the model's final channel produced
+16/16 correct answers, confirming that the source turns themselves were
+understood. No memory result was recomputed or rescored from that diagnostic.
+
+This is the first evidence in this program for persistent latent memory rather
+than prompt retrieval: Gemma reads an ordinary turn once, a frozen shared
+writer preserves its internal activations, and a fresh Gemma uses the resulting
+numerical page without seeing the turn again. The result is still deliberately
+narrow. It covers one known relation and a known output vocabulary; the page is
+3.03--3.19 MiB for one short turn, preserves every captured slot, and may be as
+privacy-sensitive as its source. Selection, compression, multi-memory
+interference, correction, temporal supersession, and broader semantic transfer
+remain open experiments.
+
+### Internal-binding successor: pre-registration
+
+The passed run mounted the page already associated with the queried entity.
+That proves latent persistence but leaves selection outside the model. It is
+not yet the ordinary meaning of remembering. The immediate successor therefore
+uses the already-frozen writer and already-serialized held-out pages without
+additional optimization:
+
+- canonically compose the first withheld-form page for all eight unseen
+  conversations into one K/V bank;
+- mount that same complete bank for every question, so no host operation names
+  or selects the queried fact;
+- require at least 14/16 exact generations across the two withheld question
+  forms; and
+- for each entity, mount the bank containing the other seven memories and
+  require the omitted entity's original value on no more than two of eight
+  first-form questions.
+
+The composition order is page-identity order and is part of the bank identity.
+Model and runtime identities, global-layer set, dtype, head geometry, and gates
+must agree before composition. Failure is retained as evidence that the current
+writer produces readable pages but not internally addressable memory. Passing
+would establish query-to-memory binding across a small simultaneous bank; it
+would not establish capacity beyond eight entries or remove the later need for
+memory hierarchy and resource accounting.
+
+### Internal-binding run 1: failed
+
+The fixed writer and fixed held-out pages scored 2/16 with all eight memories
+mounted. The first withheld question form collapsed to `AMBER` for seven of
+eight entities; the second collapsed to `ONYX` for seven of eight. Leaving the
+queried memory out of each bank reproduced its original value 0/8 times, so the
+bank was carrying the individual values, but its keys did not let Gemma select
+the requested one. The 25,067,520-byte bank has identity
+`b573eb0806012aefb836f055a9d123c049815b4a5addfed1cc843aa38a8b1806`.
+
+This rejects the claim that the first writer already produced ordinary,
+internally addressable memory. Single-page recall required the host to choose
+the page. The failure is structurally informative: single-page training gives
+the writer no reason to make keys discriminative because every memory softmax
+contains only one fact.
+
+### Addressable-writer successor: pre-registration
+
+One successor is registered before additional optimization. It begins from the
+passed writer identity above and adds 320 deterministic updates with
+simultaneous-memory pressure:
+
+- each training step mounts eight calibration memories containing all eight
+  values and sharing one of the four balanced training statement forms;
+- the question names one target entity, while the other seven memories are
+  genuine distractors inside the same memory softmax;
+- the writer remains shared, Gemma remains frozen, and no entity-specific
+  parameter or external target selector is introduced;
+- Adam remains at `1e-3`; the four training question forms rotate exactly as in
+  the first writer run;
+- after the update schedule, writer weights freeze before the unseen
+  conversations are recaptured;
+- the complete eight-entry held-out bank must score at least 14/16 exact over
+  the two withheld question forms;
+- eight leave-one-out banks may reproduce the omitted entity's value at most
+  twice; and
+- a separate process must load the serialized complete bank, without source
+  turns, writer execution, or ordinary KV state, and reproduce the same gate.
+
+Failure rejects this writer architecture as a scalable internal binder. No
+post-hoc gate, bank size, rank, or learning-rate change is permitted under this
+experiment identity.
+
+### Addressable-writer run: failed
+
+The successor scored 3/16 after the registered 320 updates. Loss fell during
+the first two passes but plateaued around `0.71` and ended at `0.8359375`.
+Leave-one-out leakage remained 0/8. The writer therefore learned somewhat less
+degenerate values but did not create a general query-addressable key space.
+Its held-out bank identity is
+`4ea6b2d38ff965c51e65d5bdd7450d6792d78bc672d01e10980a5cc623378f83`.
+
+This rejects the writer-only architecture for internal binding. The sidecar
+transforms memory keys and values but leaves each live memory query in Gemma's
+native full-attention query space. Answer loss cannot reliably force one side
+of that mismatched representation to become a general associative address.
+
+### Shared reader-writer successor: pre-registration
+
+The final registered successor adds the missing symmetric half: one shared
+rank-32 residual query projection at each of the ten global layers. The
+memory-key/value writer begins from the failed writer identity
+`3ea6d1548ab7197d73f1b785f05dccbe85598b4e2469cfd72fe3b050ec2e2e7e`;
+the query projections begin as exact identities. Gemma remains frozen.
+
+The experiment otherwise repeats the fixed simultaneous-memory contract:
+
+- 320 deterministic updates, Adam at `1e-3`, banks of eight calibration
+  memories with all eight values, and the same question rotation;
+- query and memory projections are shared across every entity; no identifier,
+  page index, or target mask reaches inference;
+- reader and writer freeze before held-out conversations are recaptured;
+- one complete eight-memory held-out bank must score at least 14/16;
+- leave-one-out banks may reproduce the omitted value at most twice; and
+- a separate process must load only the frozen shared adapter, serialized bank,
+  fresh question, and unchanged Gemma and reproduce the recall gate.
+
+Failure ends this sidecar line: the next experiment would require an explicit
+associative/contrastive objective and therefore a new registered mechanism,
+not another tuning pass.
+
+### Shared reader-writer result: failed; sidecar line closed
+
+The reader-writer adapter ended at loss `0.746123` after the registered 320
+updates and scored 2/16 on the held-out eight-memory bank. Leave-one-out banks
+reproduced the omitted value once in eight cases. The 983,040-parameter adapter
+has SHA-256
+`8d4d523ae70e58ba53bd8c9df8873b9ca5814192632f19512b8e6584a5fd808a`;
+its held-out bank identity is
+`03c766dc7d52f5c01a3203af6bd2404452161b315eb4214cefd1bef7e25791df`.
+
+The registered stop condition applies. Answer-token loss did not teach a
+general associative address even when both memory keys and live queries were
+trainable through shared residual projections. No further rank, schedule,
+initialization, or learning-rate sweep is evidence under this mechanism.
+
+The combined evidence supports two claims and rejects a third:
+
+1. Gemma can read a removable external K/V memory channel.
+2. A frozen shared writer can turn an unseen ordinary conversation into a
+   serialized latent page that reproduces its value exactly after process
+   death, with no source text in the new context.
+3. The current sidecar does **not** let Gemma simply remember among simultaneous
+   memories. Its successful single-page runs still depend on an external page
+   selection step.
+
+The next legitimate mechanism must supervise association itself: query and
+memory representations need a registered contrastive or target-mass objective,
+with answer generation remaining the downstream evaluation rather than the
+only training signal. That is a new experiment and claim, not a continuation
+of this sweep.
+
 This direction is supported, but not proven for Astrid, by prior work showing
 that learned continuous prefixes and soft prompts can condition frozen models
 with a small parameter fraction, and that activation additions can steer

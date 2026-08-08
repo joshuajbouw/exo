@@ -15,7 +15,10 @@ from gemma4_memory_sidecar_mlx import (
     MemoryPage,
     MemorySidecarError,
     NativeMemoryCompiler,
+    compose_memory_pages,
+    load_memory_page,
     mount_memory_sidecar,
+    save_memory_page,
 )
 from mlx_lm.models.gemma4_text import Model, ModelArgs
 
@@ -159,3 +162,94 @@ def test_bfloat16_page_identity_is_stable() -> None:
     mx.eval(*(value for layer in compiled for value in (layer.keys, layer.values)))
     assert mx.allclose(compiled[0].keys, first.layers[0].keys).item()
     assert mx.allclose(compiled[0].values, first.layers[0].values).item()
+
+
+def test_memory_page_round_trips_without_source_tokens(tmp_path: Path) -> None:
+    mx.random.seed(43)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    page = mounted.compile_page(model.model.embed_tokens(mx.array([[53, 59, 61]])))
+    path = tmp_path / "memory.safetensors"
+
+    save_memory_page(page, path)
+    restored = load_memory_page(path)
+
+    assert restored.page_id == page.page_id
+    assert restored.model_id == page.model_id
+    assert restored.runtime_profile == page.runtime_profile
+    assert len(restored.layers) == len(page.layers)
+    for expected, actual in zip(page.layers, restored.layers, strict=True):
+        assert actual.layer_index == expected.layer_index
+        assert actual.gate == expected.gate
+        assert mx.array_equal(actual.keys, expected.keys).item()
+        assert mx.array_equal(actual.values, expected.values).item()
+
+
+def test_memory_page_save_and_load_reject_stale_identity(tmp_path: Path) -> None:
+    mx.random.seed(47)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    page = mounted.compile_page(model.model.embed_tokens(mx.array([[67, 71]])))
+    path = tmp_path / "memory.safetensors"
+    try:
+        save_memory_page(replace(page, page_id="0" * 64), path)
+    except MemorySidecarError as error:
+        assert "identity does not match" in str(error)
+    else:
+        raise AssertionError("stale page identity unexpectedly saved")
+
+    save_memory_page(page, path)
+    arrays, metadata = mx.load(path, return_metadata=True)
+    first_name = sorted(arrays)[0]
+    arrays[first_name] = arrays[first_name] + 1
+    mx.save_safetensors(path, arrays, metadata=metadata)
+
+    try:
+        load_memory_page(path)
+    except MemorySidecarError as error:
+        assert "identity does not match" in str(error)
+    else:
+        raise AssertionError("stale page identity unexpectedly loaded")
+
+
+def test_memory_composition_is_canonical_and_preserves_all_slots() -> None:
+    mx.random.seed(53)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    first = mounted.compile_page(model.model.embed_tokens(mx.array([[73, 79]])))
+    second = mounted.compile_page(model.model.embed_tokens(mx.array([[83, 89, 97]])))
+
+    forward = compose_memory_pages((first, second))
+    reverse = compose_memory_pages((second, first))
+
+    assert forward.page_id == reverse.page_id
+    assert forward.layers[0].keys.shape[2] == 5
+    assert forward.layers[0].values.shape[2] == 5
+    mounted.activate(forward, proof_id="proof:composed")
+
+
+def test_memory_composition_rejects_duplicates_and_incompatible_pages() -> None:
+    mx.random.seed(59)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    page = mounted.compile_page(model.model.embed_tokens(mx.array([[101, 103]])))
+    invalid_sets = (
+        (page, page),
+        (page, replace(page, page_id="0" * 64)),
+        (page, replace(page, model_id="other-model")),
+    )
+    for invalid in invalid_sets:
+        try:
+            compose_memory_pages(invalid)
+        except MemorySidecarError:
+            pass
+        else:
+            raise AssertionError("invalid memory composition unexpectedly succeeded")
