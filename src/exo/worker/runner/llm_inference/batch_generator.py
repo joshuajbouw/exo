@@ -36,6 +36,11 @@ from exo.worker.engines.mlx.generator.generate import (
     mlx_generate,
     warmup_inference,
 )
+from exo.worker.engines.mlx.latent_memory import (
+    LatentMemoryActivation,
+    LatentMemoryResolver,
+    MountedLatentMemory,
+)
 from exo.worker.engines.mlx.types import Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -98,6 +103,8 @@ class SequentialGenerator(Engine):
     cancel_receiver: MpReceiver[TaskId]
     event_sender: MpSender[Event]
     vision_processor: VisionProcessor | None = None
+    latent_memory: MountedLatentMemory | None = None
+    latent_memory_resolver: LatentMemoryResolver | None = None
     check_for_cancel_every: int = 50
 
     _cancelled_tasks: set[TaskId] = field(default_factory=set, init=False)
@@ -284,7 +291,7 @@ class SequentialGenerator(Engine):
 
                 self.agree_on_tasks()
 
-        return mlx_generate(
+        generator = mlx_generate(
             model=self.model,
             tokenizer=self.tokenizer,
             task=task.task_params,
@@ -297,6 +304,15 @@ class SequentialGenerator(Engine):
             vision_processor=self.vision_processor,
             response_id=f"resp_{task.command_id}",
         )
+        resolver = self.latent_memory_resolver
+        if resolver is None:
+            return generator
+        activation = resolver.resolve(str(task.task_id))
+        if activation is None:
+            return generator
+        if self.latent_memory is None:
+            raise RuntimeError("latent-memory resolver has no mounted model channel")
+        return _run_with_latent_memory(generator, self.latent_memory, activation)
 
     def close(self) -> None:
         if self.kv_prefix_cache is not None:
@@ -304,6 +320,10 @@ class SequentialGenerator(Engine):
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
+        if self.latent_memory_resolver is not None:
+            raise RuntimeError(
+                "remote prefill is unavailable for invocation-scoped latent memory"
+            )
         cache = run_prefill_for_request(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -318,6 +338,17 @@ class SequentialGenerator(Engine):
             model_id=request.model_id,
             start_pos=request.start_pos,
         )
+
+
+def _run_with_latent_memory(
+    generator: Generator[GenerationResponse],
+    mounted: MountedLatentMemory,
+    activation: LatentMemoryActivation,
+) -> Generator[GenerationResponse]:
+    """Keep one externally selected latent page scoped to one invocation."""
+
+    with mounted.activation(activation.page, activation.selection):
+        yield from generator
 
 
 @dataclass(eq=False)

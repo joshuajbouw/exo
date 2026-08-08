@@ -145,6 +145,13 @@ the authority-bearing page selector.
 
 ## Code map
 
+- `src/exo/worker/engines/mlx/latent_memory.py`: production adoption of the
+  proven page format, identity checks, Gemma 4 attention mount, and exclusive
+  invocation scope. The inactive path does not alter model input.
+- `MlxBuilder` / `SequentialGenerator`: injection seam for a trusted resolver
+  that supplies an already-selected page by invocation identity. Enabling this
+  seam deliberately disables request batching until heterogeneous pages have a
+  correct per-row representation; no resolver is configured by default.
 - `gemma4_memory_sidecar_mlx.py`: latent-page representation and mounting seam.
 - `grounded_memory_selection.py`: deterministic catalog, capability, epoch, and
   page-bound proof derivation.
@@ -162,3 +169,8 @@ the authority-bearing page selector.
   results, subordinate to this contract.
 - `PERSISTENT_WEIGHT_MEMORY.md`: LoRA experiment record, subordinate to this
   contract.
+
+The production seam does not implement grounding, authorization, page
+compilation policy, or a public request API. Those remain upstream concerns.
+In particular, it cannot derive a page from prompt text and it cannot make the
+failed internal multi-page routing experiments valid.

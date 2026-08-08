@@ -22,6 +22,7 @@ from exo.worker.runner.llm_inference.tool_parsers import make_mlx_parser
 
 from .cache import KVPrefixCache
 from .computation_persistence import configured_computation_persistence
+from .latent_memory import LatentMemoryResolver, mount_latent_memory
 from .types import Model
 from .utils_mlx import (
     initialize_mlx,
@@ -40,6 +41,7 @@ class MlxBuilder(Builder):
     group: mx.distributed.Group | None = None
     vision_processor: VisionProcessor | None = None
     shard_profile: str | None = None
+    latent_memory_resolver: LatentMemoryResolver | None = None
 
     def connect(self, bound_instance: BoundInstance) -> None:
         self.group = initialize_mlx(bound_instance)
@@ -95,6 +97,29 @@ class MlxBuilder(Builder):
             self.shard_profile or "unconnected-single-device",
         )
         kv_prefix_cache = KVPrefixCache(self.group, persistence=persistence)
+        if self.latent_memory_resolver is not None:
+            logger.info(
+                "using SequentialGenerator (invocation-scoped latent memory enabled)"
+            )
+            latent_memory = mount_latent_memory(
+                self.inference_model,
+                model_id=str(self.model_id),
+                runtime_profile=self.latent_memory_resolver.runtime_profile,
+            )
+            return SequentialGenerator(
+                model=self.inference_model,
+                tokenizer=self.tokenizer,
+                group=self.group,
+                tool_parser=tool_parser,
+                kv_prefix_cache=kv_prefix_cache,
+                model_id=self.model_id,
+                device_rank=device_rank,
+                cancel_receiver=self.cancel_receiver,
+                event_sender=self.event_sender,
+                vision_processor=vision_processor,
+                latent_memory=latent_memory,
+                latent_memory_resolver=self.latent_memory_resolver,
+            )
         if os.environ.get("EXO_NO_BATCH"):
             logger.info("using SequentialGenerator (batching disabled)")
             return SequentialGenerator(

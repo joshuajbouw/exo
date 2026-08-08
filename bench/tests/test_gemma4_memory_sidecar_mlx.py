@@ -24,6 +24,8 @@ from gemma4_memory_sidecar_mlx import (
 from grounded_memory_selection import MemorySelectionError
 from mlx_lm.models.gemma4_text import Model, ModelArgs
 
+from exo.worker.engines.mlx.latent_memory import load_latent_memory_page
+
 
 def _model() -> Model:
     args = ModelArgs(
@@ -219,6 +221,23 @@ def test_memory_page_round_trips_without_source_tokens(tmp_path: Path) -> None:
         assert actual.gate == expected.gate
         assert mx.array_equal(actual.keys, expected.keys).item()
         assert mx.array_equal(actual.values, expected.values).item()
+
+
+def test_production_loader_adopts_the_proven_page_format(tmp_path: Path) -> None:
+    mx.random.seed(44)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    page = mounted.compile_page(model.model.embed_tokens(mx.array([[61, 67, 71]])))
+    path = tmp_path / "experimental-page.safetensors"
+
+    save_memory_page(page, path)
+    production = load_latent_memory_page(path)
+
+    assert production.page_id == page.page_id
+    assert production.model_id == page.model_id
+    assert production.runtime_profile == page.runtime_profile
 
 
 def test_memory_page_save_and_load_reject_stale_identity(tmp_path: Path) -> None:
