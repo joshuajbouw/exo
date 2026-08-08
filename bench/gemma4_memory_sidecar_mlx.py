@@ -313,6 +313,10 @@ class _MemoryAttention(nn.Module):
         self._active = active
         self._capture = False
         self._captured: LayerMemory | None = None
+        self._trace = False
+        self._traced: mx.array | None = None
+        self._association_trace = False
+        self._association_query: mx.array | None = None
 
     def begin_capture(self) -> None:
         self._capture = True
@@ -327,6 +331,38 @@ class _MemoryAttention(nn.Module):
                 f"full-attention layer {self.layer_index} did not capture memory"
             )
         return captured
+
+    def begin_trace(self) -> None:
+        self._trace = True
+        self._traced = None
+
+    def finish_trace(self) -> mx.array:
+        self._trace = False
+        traced = self._traced
+        self._traced = None
+        if traced is None:
+            raise MemorySidecarError(
+                f"full-attention layer {self.layer_index} did not produce a trace"
+            )
+        return traced
+
+    def _record_trace(self, output: mx.array) -> None:
+        if self._trace:
+            self._traced = output
+
+    def begin_association_trace(self) -> None:
+        self._association_trace = True
+        self._association_query = None
+
+    def finish_association_trace(self) -> mx.array:
+        self._association_trace = False
+        query = self._association_query
+        self._association_query = None
+        if query is None:
+            raise MemorySidecarError(
+                f"full-attention layer {self.layer_index} did not produce a memory query"
+            )
+        return query
 
     def _native_memory_projection(self, x: mx.array) -> tuple[mx.array, mx.array]:
         batch, length, _ = x.shape
@@ -363,9 +399,11 @@ class _MemoryAttention(nn.Module):
         )
         active_layers = self._active.layers
         if active_layers is None:
+            self._record_trace(output)
             return output, shared_kv, offset
         memory = active_layers.get(self.layer_index)
         if memory is None:
+            self._record_trace(output)
             return output, shared_kv, offset
 
         batch, length, _ = x.shape
@@ -381,6 +419,8 @@ class _MemoryAttention(nn.Module):
                     f"memory query projection missing layer {self.layer_index}"
                 )
             queries = projection(queries)
+        if self._association_trace:
+            self._association_query = queries
 
         keys = memory.keys
         values = memory.values
@@ -399,7 +439,9 @@ class _MemoryAttention(nn.Module):
         )
         memory_output = memory_output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         memory_output = self.base.o_proj(memory_output)
-        return output + memory.gate * memory_output, shared_kv, offset
+        output = output + memory.gate * memory_output
+        self._record_trace(output)
+        return output, shared_kv, offset
 
 
 def _array_identity(digest: Any, value: mx.array) -> None:
@@ -437,6 +479,20 @@ class MountedMemorySidecar:
     runtime_profile: str
     sites: tuple[_MemoryAttention, ...]
     _active: _ActiveMemory
+
+    def begin_trace(self) -> None:
+        for site in self.sites:
+            site.begin_trace()
+
+    def finish_trace(self) -> tuple[mx.array, ...]:
+        return tuple(site.finish_trace() for site in self.sites)
+
+    def begin_association_trace(self) -> None:
+        for site in self.sites:
+            site.begin_association_trace()
+
+    def finish_association_trace(self) -> tuple[mx.array, ...]:
+        return tuple(site.finish_association_trace() for site in self.sites)
 
     def compile_page(
         self, slot_embeddings: mx.array, *, gates: dict[int, float] | None = None

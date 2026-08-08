@@ -253,3 +253,30 @@ def test_memory_composition_rejects_duplicates_and_incompatible_pages() -> None:
             pass
         else:
             raise AssertionError("invalid memory composition unexpectedly succeeded")
+
+
+def test_trace_records_the_effective_global_attention_output() -> None:
+    mx.random.seed(61)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    tokens = mx.array([[7, 11, 13]])
+
+    mounted.begin_trace()
+    _logits(model, tokens)
+    base_trace = mounted.finish_trace()
+
+    page = mounted.compile_page(model.model.embed_tokens(mx.array([[17, 19]])))
+    mounted.activate(page, proof_id="proof:trace")
+    mounted.begin_trace()
+    mounted.begin_association_trace()
+    _logits(model, tokens)
+    memory_trace = mounted.finish_trace()
+    association_queries = mounted.finish_association_trace()
+
+    assert len(base_trace) == 1
+    assert base_trace[0].shape == (1, 3, 32)
+    assert memory_trace[0].shape == base_trace[0].shape
+    assert association_queries[0].shape == (1, 4, 3, 8)
+    assert not mx.array_equal(memory_trace[0], base_trace[0]).item()

@@ -784,6 +784,97 @@ with answer generation remaining the downstream evaluation rather than the
 only training signal. That is a new experiment and claim, not a continuation
 of this sweep.
 
+## Latent episodic distillation: pre-registration
+
+The new mechanism uses frozen Gemma as its own memory teacher. For each
+calibration episode, teacher execution receives a natural-language history
+prefix followed by the exact query-and-answer suffix used by the student. The
+mounted sidecar records the effective output of every global-attention module
+over the suffix. Student execution removes the history prefix, mounts an
+eight-entry latent bank containing the target and seven distractors, and trains
+a fresh shared reader-writer adapter to reconstruct the teacher traces.
+
+This directly supervises the internal operation lost when history disappears.
+It does not label or extract a subject, predicate, object, entity address, page
+index, or semantic fact. The only association label is causal structure: this
+teacher trace came from this complete history and this unchanged suffix.
+
+The fixed experiment is:
+
+- the same 32 balanced calibration conversations, eight held-out
+  conversations, four training statement/query forms, and two fully held-out
+  statement/query forms;
+- a fresh rank-32 shared reader-writer adapter at the ten global layers; Gemma
+  remains frozen;
+- training banks contain all eight values and one target conversation per
+  query, with no target mask reaching the model;
+- 320 deterministic updates with Adam at `1e-3`;
+- loss is the mean normalized squared error across all ten suffix attention
+  traces plus `0.1` times answer-token cross-entropy;
+- teacher traces are fixed before the corresponding student update and are
+  never differentiated through;
+- adapter weights freeze before the eight unseen conversations are encoded;
+- one simultaneous eight-memory bank must score at least 14/16 exact on the
+  two unseen question forms;
+- leave-one-out banks may reproduce the omitted value at most twice; and
+- a separate process loading only unchanged Gemma, the serialized adapter and
+  latent bank must reproduce the recall gate.
+
+Failure rejects attention-output distillation at this seam and is not followed
+by loss-weight or schedule tuning under this experiment identity.
+
+### Attention-output distillation result: failed
+
+The normalized trace loss fell from `0.744146` to `0.142291`, and answer loss
+fell from `13.334494` to `0.793312`, but the unseen eight-memory bank still
+collapsed to `ONYX` and scored 2/16. Leave-one-out leakage was 1/8. The adapter
+has SHA-256
+`d51b72e22de4b3f92678c412a182c510d6b31c8b14548c4297774de1e07b3b97`.
+
+The mechanism learned to approximate a common teacher-output component without
+learning which episode caused it. Output reconstruction alone therefore has an
+average-solution degeneracy.
+
+### Causal association successor: pre-registration
+
+The successor adds one new signal, derived without semantic interpretation.
+For each calibration query, provenance identifies the episode whose full
+history produced the fixed teacher trace. At every global layer, the final
+prompt query must assign probability mass to that episode's memory slots rather
+than the seven distractor episodes.
+
+The adapter begins from the failed distillation identity above and receives 320
+additional deterministic updates with Adam at `1e-3`. Loss weights are fixed:
+normalized teacher-trace reconstruction `1.0`, causal target-mass negative log
+likelihood `1.0`, and answer cross-entropy `0.1`. The target span is available
+only to the training loss; it is absent from page bytes and inference. The same
+14/16 held-out bank, at-most-2/8 leave-one-out, and fresh-process gates apply.
+Failure closes this experiment family.
+
+### Causal association result: failed; experiment family closed
+
+The causal objective learned on calibration episodes: target-span association
+loss fell from the random eight-way region (`ln(8) = 2.079`) to `1.084389` by
+update 320. Nevertheless, the unseen eight-memory bank again scored 2/16, with
+1/8 leave-one-out leakage. The adapter has SHA-256
+`4680ac28bde72188496762bb1d4b501aa624990a58234ebe25031d6c45f031c7`;
+the bank identity is
+`cedd1e374b294f00456e468763a982e097b122a98e41664bc3f6a7e934236850`.
+
+This is not an optimization failure on the registered population. It is a
+generalization failure: 32 synthetic calibration episodes taught an address
+system for those episodes and sentence forms, not a model-wide language of
+memory addressing that transfers to unseen entities and unseen forms.
+
+The pure mechanism remains precisely specified but requires a different scale
+of evidence. Its next legitimate implementation is corpus-scale self-supervised
+training over diverse natural continuations: full-context Gemma supplies
+attention/output teachers; removed histories become latent pages; many unrelated
+episodes provide distractors; causal provenance supplies association targets;
+and unseen conversations, domains, relations, and time gaps define evaluation.
+The four small synthetic runs in this section are retained as failure evidence
+and must not be reported as spontaneous memory.
+
 This direction is supported, but not proven for Astrid, by prior work showing
 that learned continuous prefixes and soft prompts can condition frozen models
 with a small parameter fraction, and that activation additions can steer
