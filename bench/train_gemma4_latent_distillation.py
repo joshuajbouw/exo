@@ -17,6 +17,7 @@ from gemma4_memory_sidecar_mlx import (
     AddressableMemoryAdapter,
     LayerMemory,
     MemoryPage,
+    MemorySelectionProof,
     compose_memory_pages,
     mount_memory_sidecar,
     save_memory_page,
@@ -214,7 +215,13 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
     save_memory_page(bank, bank_path)
 
     mounted.activate(
-        bank, proof_id=f"proof:distilled-bank:{bank.page_id}", reader=adapter
+        bank,
+        proof=MemorySelectionProof.for_page(
+            bank,
+            proof_id=f"proof:distilled-bank:{bank.page_id}",
+            fact_snapshot_id="distilled-bank-fixture",
+        ),
+        reader=adapter,
     )
     evaluations: list[dict[str, object]] = []
     for fact in test_facts:
@@ -239,7 +246,11 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
         )
         mounted.activate(
             omission_bank,
-            proof_id=f"proof:distilled-omission:{fact.fact_id}",
+            proof=MemorySelectionProof.for_page(
+                omission_bank,
+                proof_id=f"proof:distilled-omission:{fact.fact_id}",
+                fact_snapshot_id="distilled-omission-fixture",
+            ),
             reader=adapter,
         )
         response = _generate(

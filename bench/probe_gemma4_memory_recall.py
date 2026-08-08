@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
-from gemma4_memory_sidecar_mlx import mount_memory_sidecar
+from gemma4_memory_sidecar_mlx import MemorySelectionProof, mount_memory_sidecar
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
 
@@ -52,7 +52,14 @@ def run(
     memory_tokens = mx.array([tokenizer.encode(memory_text)], dtype=mx.int32)
     slot_embeddings = model.language_model.model.embed_tokens(memory_tokens)
     page = mounted.compile_page(slot_embeddings)
-    mounted.activate(page, proof_id="proof:gemma4-memory-recall")
+    mounted.activate(
+        page,
+        proof=MemorySelectionProof.for_page(
+            page,
+            proof_id="proof:gemma4-memory-recall",
+            fact_snapshot_id="memory-recall-probe-fixture",
+        ),
+    )
     active_started = time.perf_counter()
     active = _generate(model, tokenizer, query, maximum_tokens)
     active_seconds = time.perf_counter() - active_started

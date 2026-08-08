@@ -1,5 +1,9 @@
 # Persistent weight memory experiment
 
+Architecture and terminology are governed by
+[`MEMORY_CONTRACT.md`](MEMORY_CONTRACT.md). This file is an experiment record,
+not the definition of long-term memory.
+
 This experiment asks a narrow question: can a model learn a novel rule, lose
 its teaching context and KV cache, restart in another process, and still apply
 the rule without damaging unrelated behavior?

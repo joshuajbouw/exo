@@ -51,6 +51,33 @@ class MemoryPage:
         return sum(layer.resident_bytes for layer in self.layers)
 
 
+@dataclass(frozen=True, slots=True)
+class MemorySelectionProof:
+    """Grounded external selection bound to exactly one mounted page."""
+
+    proof_id: str
+    fact_snapshot_id: str
+    selected_page_id: str
+
+    def __post_init__(self) -> None:
+        if not self.proof_id:
+            raise MemorySidecarError("memory selection proof identity is empty")
+        if not self.fact_snapshot_id:
+            raise MemorySidecarError("memory selection fact snapshot is empty")
+        if not self.selected_page_id:
+            raise MemorySidecarError("memory selection has no page identity")
+
+    @classmethod
+    def for_page(
+        cls,
+        page: MemoryPage,
+        *,
+        proof_id: str,
+        fact_snapshot_id: str,
+    ) -> MemorySelectionProof:
+        return cls(proof_id, fact_snapshot_id, page.page_id)
+
+
 def save_memory_page(page: MemoryPage, path: Path) -> None:
     """Persist an immutable page without retaining its source tokens."""
 
@@ -206,7 +233,7 @@ def compose_memory_pages(pages: tuple[MemoryPage, ...]) -> MemoryPage:
 @dataclass(slots=True)
 class _ActiveMemory:
     page: MemoryPage | None = None
-    proof_id: str | None = None
+    selection: MemorySelectionProof | None = None
     layers: dict[int, LayerMemory] | None = None
     query_projections: dict[int, Any] | None = None
     training: bool = False
@@ -538,11 +565,11 @@ class MountedMemorySidecar:
         self,
         page: MemoryPage,
         *,
-        proof_id: str,
+        proof: MemorySelectionProof,
         reader: AddressableMemoryAdapter | None = None,
     ) -> None:
-        if not proof_id:
-            raise MemorySidecarError("activation requires a proof identity")
+        if proof.selected_page_id != page.page_id:
+            raise MemorySidecarError("memory selection proof names a different page")
         if page.model_id != self.model_id:
             raise MemorySidecarError("memory page targets a different model")
         if page.runtime_profile != self.runtime_profile:
@@ -583,12 +610,11 @@ class MountedMemorySidecar:
                 "cannot activate a page while training memory is live"
             )
         if self._active.page is not None and (
-            self._active.page.page_id != page.page_id
-            or self._active.proof_id != proof_id
+            self._active.page.page_id != page.page_id or self._active.selection != proof
         ):
             raise MemorySidecarError("a different memory proof is already active")
         self._active.page = page
-        self._active.proof_id = proof_id
+        self._active.selection = proof
         self._active.layers = {layer.layer_index: layer for layer in page.layers}
         if reader is not None:
             if reader.layer_indices != expected:
@@ -652,7 +678,7 @@ class MountedMemorySidecar:
 
     def deactivate(self) -> None:
         self._active.page = None
-        self._active.proof_id = None
+        self._active.selection = None
         self._active.layers = None
         self._active.query_projections = None
         self._active.training = False

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
-from gemma4_memory_sidecar_mlx import mount_memory_sidecar
+from gemma4_memory_sidecar_mlx import MemorySelectionProof, mount_memory_sidecar
 from mlx_lm import load
 
 
@@ -51,7 +51,14 @@ def run(model_path: Path, prompt: str, memory_text: str) -> dict[str, object]:
     page = mounted.compile_page(slot_embeddings)
     compile_seconds = time.perf_counter() - compile_started
 
-    mounted.activate(page, proof_id="proof:gemma4-memory-sidecar-probe")
+    mounted.activate(
+        page,
+        proof=MemorySelectionProof.for_page(
+            page,
+            proof_id="proof:gemma4-memory-sidecar-probe",
+            fact_snapshot_id="sidecar-probe-fixture",
+        ),
+    )
     active_started = time.perf_counter()
     active_logits = _last_logits(model, tokens)
     active_seconds = time.perf_counter() - active_started

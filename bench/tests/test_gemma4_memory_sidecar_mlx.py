@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 from gemma4_memory_sidecar_mlx import (
     DirectMemoryBank,
     MemoryPage,
+    MemorySelectionProof,
     MemorySidecarError,
     NativeMemoryCompiler,
     compose_memory_pages,
@@ -50,6 +51,14 @@ def _logits(model: Model, tokens: mx.array) -> mx.array:
     return logits
 
 
+def _proof(page: MemoryPage, name: str) -> MemorySelectionProof:
+    return MemorySelectionProof.for_page(
+        page,
+        proof_id=f"proof:{name}",
+        fact_snapshot_id="benchmark-fact-snapshot",
+    )
+
+
 def test_inactive_sidecar_is_exact_and_revocation_restores_base() -> None:
     mx.random.seed(11)
     model = _model()
@@ -64,7 +73,7 @@ def test_inactive_sidecar_is_exact_and_revocation_restores_base() -> None:
 
     slots = model.model.embed_tokens(mx.array([[17, 19, 23]]))
     page = mounted.compile_page(slots)
-    mounted.activate(page, proof_id="proof:alpha")
+    mounted.activate(page, proof=_proof(page, "alpha"))
     active = _logits(model, tokens)
     assert not mx.array_equal(base, active).item()
 
@@ -80,7 +89,7 @@ def test_page_is_external_to_the_ordinary_cache() -> None:
         model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
     )
     page = mounted.compile_page(model.model.embed_tokens(mx.array([[29, 31]])))
-    mounted.activate(page, proof_id="proof:cache")
+    mounted.activate(page, proof=_proof(page, "cache"))
 
     cache = model.make_cache()
     model(mx.array([[1, 2, 3]]), cache=cache)
@@ -97,19 +106,43 @@ def test_activation_requires_matching_identity_and_proof() -> None:
     page = mounted.compile_page(model.model.embed_tokens(mx.array([[41]])))
 
     try:
-        mounted.activate(page, proof_id="")
+        mounted.activate(
+            page,
+            proof=MemorySelectionProof(
+                "",
+                "benchmark-fact-snapshot",
+                page.page_id,
+            ),
+        )
     except MemorySidecarError as error:
         assert "proof identity" in str(error)
     else:
         raise AssertionError("empty proof unexpectedly activated a memory page")
 
-    mounted.activate(page, proof_id="proof:first")
+    mounted.activate(page, proof=_proof(page, "first"))
     try:
-        mounted.activate(page, proof_id="proof:second")
+        mounted.activate(page, proof=_proof(page, "second"))
     except MemorySidecarError as error:
         assert "different memory proof" in str(error)
     else:
         raise AssertionError("a second proof replaced the active proof")
+
+
+def test_selection_proof_cannot_activate_another_page() -> None:
+    mx.random.seed(38)
+    model = _model()
+    mounted = mount_memory_sidecar(
+        model, model_id="tiny-gemma4", runtime_profile="mlx-test-v1"
+    )
+    selected = mounted.compile_page(model.model.embed_tokens(mx.array([[41]])))
+    substituted = mounted.compile_page(model.model.embed_tokens(mx.array([[43]])))
+
+    try:
+        mounted.activate(substituted, proof=_proof(selected, "selected"))
+    except MemorySidecarError as error:
+        assert "different page" in str(error)
+    else:
+        raise AssertionError("a proof activated a page it did not select")
 
 
 def test_activation_recomputes_identity_and_requires_canonical_layers() -> None:
@@ -135,7 +168,7 @@ def test_activation_recomputes_identity_and_requires_canonical_layers() -> None:
     )
     for invalid in invalid_pages:
         try:
-            mounted.activate(invalid, proof_id="proof:invalid")
+            mounted.activate(invalid, proof=_proof(invalid, "invalid"))
         except MemorySidecarError:
             pass
         else:
@@ -231,7 +264,7 @@ def test_memory_composition_is_canonical_and_preserves_all_slots() -> None:
     assert forward.page_id == reverse.page_id
     assert forward.layers[0].keys.shape[2] == 5
     assert forward.layers[0].values.shape[2] == 5
-    mounted.activate(forward, proof_id="proof:composed")
+    mounted.activate(forward, proof=_proof(forward, "composed"))
 
 
 def test_memory_composition_rejects_duplicates_and_incompatible_pages() -> None:
@@ -268,7 +301,7 @@ def test_trace_records_the_effective_global_attention_output() -> None:
     base_trace = mounted.finish_trace()
 
     page = mounted.compile_page(model.model.embed_tokens(mx.array([[17, 19]])))
-    mounted.activate(page, proof_id="proof:trace")
+    mounted.activate(page, proof=_proof(page, "trace"))
     mounted.begin_trace()
     mounted.begin_association_trace()
     _logits(model, tokens)

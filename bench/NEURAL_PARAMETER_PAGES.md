@@ -3,6 +3,11 @@
 Status: pre-registered experiment contract. This document defines what the
 prototype may claim before the implementation or its results exist.
 
+The system-level architecture and the distinction between authoritative
+memory, grounded selection, latent pages, and hot continuation K/V are
+normative in [`MEMORY_CONTRACT.md`](MEMORY_CONTRACT.md). This file records the
+chronological experiments underneath that contract.
+
 ## Question and determination boundary
 
 Can a frozen language model acquire a removable, principal-scoped neural
@@ -882,13 +887,15 @@ high-level output properties without weight updates. Those results do not
 establish capability isolation, canonical identity, or proof-bound selection;
 those remain this design's claim and test burden.
 
-## Native continuation memory: pre-registration
+## Native continuation baseline: pre-registration
 
 The sidecar experiments attempted to teach Gemma a second memory language even
 though the model already exposes its own exact continuation state: the native
 attention K/V cache. The next experiment therefore removes training entirely.
-It asks whether Exo can make one ordinary conversation survive process death by
-persisting that native state and restoring it for an append-only turn.
+It asks whether Exo can make one ordinary conversational computation survive
+process death by persisting that native state and restoring it for an
+append-only turn. Under [`MEMORY_CONTRACT.md`](MEMORY_CONTRACT.md), this is a
+hot-cache baseline and cannot establish long-term memory.
 
 The fixed gate is:
 
@@ -915,7 +922,7 @@ The fixed gate is:
 
 The harness records checkpoint bytes, restore time, time to first token, cached
 tokens, and output tokens. Passing proves exact model-specific continuation
-memory across process death. It does not prove associative recall, portable
+reuse across process death. It does not prove associative recall, portable
 weights, compression, or an unbounded context: native K/V still grows with the
 retained frontier and remains subject to the model's positional semantics.
 
@@ -923,7 +930,7 @@ Failure ends this mechanism at the first mismatched token or log-probability.
 No tolerance, semantic scoring, prompt change, or learned repair is permitted
 under this experiment identity.
 
-### Native continuation result: passed
+### Native continuation baseline result: passed
 
 Three independent source terms and values passed after correcting the harness
 to close durable publication before the reference question was ever computed.
@@ -934,18 +941,25 @@ Across all three runs, a newly loaded Gemma process produced the same complete
 answer token sequence and the same selected-token log-probability bits as the
 uninterrupted process. The restored path reused 64--66 source-frontier tokens;
 the no-memory controls instead stated that the invented value was unavailable.
-The stores occupied 116.4--120.1 MB, or approximately 1.82 MB per cached token.
+The short-frontier stores occupied 116.4--120.1 MB, or approximately 1.82 MB
+per cached token in these runs. That ratio is not an asymptotic slope: all
+fifty sliding-attention layers were below their 1,024-token cap, and MLX tensor
+allocation overhead was amortized over only 64--66 logical cached tokens. For
+this model configuration the long-context raw-BF16 cache approaches roughly
+80 KiB per additional token after the sliding caches saturate, plus about
+800 MiB of bounded sliding state.
+
 Projection identity verification took 5.6--6.7 ms and MLX cache loading took
 less than 1 ms. Restored time to first token was 1.52--1.55 seconds, versus
 1.33--1.38 seconds for the already-hot uninterrupted process; this comparison
 includes fresh-process/device warm-up and is not a cache-load measurement.
 
-This establishes exact native continuation memory across process death without
-training or replaying source tokens through Gemma. It also quantifies why raw
-K/V is a correctness baseline rather than archival memory: the representation
-is exact and immediately usable, but linear and large. The next mechanism may
-page, quantize, or derive compact representations, but must always retain this
-exact path as its reference and fail-secure fallback.
+This establishes exact native continuation across process death without
+training or replaying source tokens through Gemma. It does not establish
+long-term memory. Raw K/V is an exact, immediately usable, model-specific
+computation cache. Paging or quantization work must retain this path as its
+reference and fail-secure fallback, while latent-memory claims remain governed
+by the separate page-selection lifecycle.
 
 ## Stop conditions
 

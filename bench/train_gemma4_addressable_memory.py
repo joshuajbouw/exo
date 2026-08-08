@@ -16,6 +16,7 @@ import mlx.optimizers as optim
 from gemma4_memory_sidecar_mlx import (
     LayerMemory,
     MemoryPage,
+    MemorySelectionProof,
     NativeMemoryCompiler,
     compose_memory_pages,
     mount_memory_sidecar,
@@ -156,7 +157,14 @@ def run(
     bank_path = output_dir / "complete-bank.safetensors"
     save_memory_page(bank, bank_path)
 
-    mounted.activate(bank, proof_id=f"proof:addressable-bank:{bank.page_id}")
+    mounted.activate(
+        bank,
+        proof=MemorySelectionProof.for_page(
+            bank,
+            proof_id=f"proof:addressable-bank:{bank.page_id}",
+            fact_snapshot_id="addressable-bank-fixture",
+        ),
+    )
     evaluations: list[dict[str, object]] = []
     for fact in test_facts:
         for query_form, template in enumerate(TEST_QUERIES):
@@ -180,7 +188,11 @@ def run(
         )
         mounted.activate(
             omission_bank,
-            proof_id=f"proof:addressable-omission:{fact.fact_id}:{omission_bank.page_id}",
+            proof=MemorySelectionProof.for_page(
+                omission_bank,
+                proof_id=f"proof:addressable-omission:{fact.fact_id}:{omission_bank.page_id}",
+                fact_snapshot_id="addressable-omission-fixture",
+            ),
         )
         response = _generate(
             model, tokenizer, TEST_QUERIES[0].format(entity=fact.entity)

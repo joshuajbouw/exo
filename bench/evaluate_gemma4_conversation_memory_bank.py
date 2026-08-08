@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from gemma4_memory_sidecar_mlx import (
+    MemorySelectionProof,
     compose_memory_pages,
     load_memory_page,
     mount_memory_sidecar,
@@ -66,7 +67,14 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
         for fact in test_facts
     }
     bank = compose_memory_pages(tuple(pages.values()))
-    mounted.activate(bank, proof_id=f"proof:complete-bank:{bank.page_id}")
+    mounted.activate(
+        bank,
+        proof=MemorySelectionProof.for_page(
+            bank,
+            proof_id=f"proof:complete-bank:{bank.page_id}",
+            fact_snapshot_id="complete-bank-fixture",
+        ),
+    )
     evaluations: list[dict[str, object]] = []
     for fact in test_facts:
         for query_form, template in enumerate(TEST_QUERIES):
@@ -91,7 +99,11 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
         omission_bank = compose_memory_pages(remaining)
         mounted.activate(
             omission_bank,
-            proof_id=f"proof:omission:{fact.fact_id}:{omission_bank.page_id}",
+            proof=MemorySelectionProof.for_page(
+                omission_bank,
+                proof_id=f"proof:omission:{fact.fact_id}:{omission_bank.page_id}",
+                fact_snapshot_id="omission-bank-fixture",
+            ),
         )
         response = _generate(
             model, tokenizer, TEST_QUERIES[0].format(entity=fact.entity)

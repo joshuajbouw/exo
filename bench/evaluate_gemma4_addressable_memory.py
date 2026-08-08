@@ -9,7 +9,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from gemma4_memory_sidecar_mlx import load_memory_page, mount_memory_sidecar
+from gemma4_memory_sidecar_mlx import (
+    MemorySelectionProof,
+    load_memory_page,
+    mount_memory_sidecar,
+)
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
 from train_gemma4_conversation_memory import (
@@ -46,7 +50,14 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
     bank = load_memory_page(artifact_dir / training_result["bank_path"])
     if bank.page_id != training_result["bank_id"]:
         raise ValueError("serialized bank identity differs from the training record")
-    mounted.activate(bank, proof_id=f"proof:fresh-addressable:{bank.page_id}")
+    mounted.activate(
+        bank,
+        proof=MemorySelectionProof.for_page(
+            bank,
+            proof_id=f"proof:fresh-addressable:{bank.page_id}",
+            fact_snapshot_id="fresh-addressable-fixture",
+        ),
+    )
 
     evaluations: list[dict[str, object]] = []
     test_facts = tuple(fact for fact in facts() if fact.split == "test")

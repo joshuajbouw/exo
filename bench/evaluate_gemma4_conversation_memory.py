@@ -9,7 +9,11 @@ import hashlib
 import json
 from pathlib import Path
 
-from gemma4_memory_sidecar_mlx import load_memory_page, mount_memory_sidecar
+from gemma4_memory_sidecar_mlx import (
+    MemorySelectionProof,
+    load_memory_page,
+    mount_memory_sidecar,
+)
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
 from train_gemma4_conversation_memory import (
@@ -66,7 +70,11 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
         stable_page_ids += page.page_id == page_record["page_id"]
         mounted.activate(
             page,
-            proof_id=f"proof:fresh-process:{fact.fact_id}:{statement_form}:{page.page_id}",
+            proof=MemorySelectionProof.for_page(
+                page,
+                proof_id=f"proof:fresh-process:{fact.fact_id}:{statement_form}:{page.page_id}",
+                fact_snapshot_id="conversation-memory-replay-fixture",
+            ),
         )
         for query_form, template in enumerate(TEST_QUERIES):
             response = _generate(model, tokenizer, template.format(entity=fact.entity))
@@ -91,7 +99,14 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
             if candidate.value != fact.value
         )
         page = loaded_pages[(wrong_fact.fact_id, 0)]
-        mounted.activate(page, proof_id=f"proof:fresh-wrong:{fact.fact_id}")
+        mounted.activate(
+            page,
+            proof=MemorySelectionProof.for_page(
+                page,
+                proof_id=f"proof:fresh-wrong:{fact.fact_id}",
+                fact_snapshot_id="conversation-wrong-page-fixture",
+            ),
+        )
         response = _generate(
             model, tokenizer, TEST_QUERIES[0].format(entity=fact.entity)
         )

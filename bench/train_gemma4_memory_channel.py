@@ -12,7 +12,11 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from gemma4_memory_sidecar_mlx import DirectMemoryBank, mount_memory_sidecar
+from gemma4_memory_sidecar_mlx import (
+    DirectMemoryBank,
+    MemorySelectionProof,
+    mount_memory_sidecar,
+)
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
 
@@ -101,7 +105,14 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
 
     mounted.deactivate()
     page = mounted.freeze_training_bank(bank)
-    mounted.activate(page, proof_id="proof:serevin-xq17-vela")
+    mounted.activate(
+        page,
+        proof=MemorySelectionProof.for_page(
+            page,
+            proof_id="proof:serevin-xq17-vela",
+            fact_snapshot_id="serevin-xq17-fixture",
+        ),
+    )
     active = [_generate(model, tokenizer, query) for query in TEST_QUERIES]
     mounted.deactivate()
     revoked = [_generate(model, tokenizer, query) for query in TEST_QUERIES]

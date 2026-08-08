@@ -386,6 +386,14 @@ stop strings. A provider-neutral selector interface lets a GPU corpus or
 relation engine rank additional candidates and receive target-verified
 acceptance feedback without becoming generation authority.
 
+Prefix checkpoints and speculative drafts conserve hot computation; they are
+not Exo's long-term-memory model. The normative
+[durable model memory contract](bench/MEMORY_CONTRACT.md) separates
+authoritative content, grounded external selection, model-readable latent
+pages, and hot continuation K/V. In particular, restoring K/V cannot satisfy a
+latent-memory claim, and a page can be mounted only by a selection proof bound
+to that exact page identity.
+
 An adjacent [persistent-weight experiment](bench/PERSISTENT_WEIGHT_MEMORY.md)
 tested whether a novel rule could survive a process restart without retained
 context. A small LoRA did persist narrow behavior, but globally enabling it

@@ -11,7 +11,11 @@ from dataclasses import asdict
 from pathlib import Path
 
 import mlx.core as mx
-from gemma4_memory_sidecar_mlx import NativeMemoryCompiler, mount_memory_sidecar
+from gemma4_memory_sidecar_mlx import (
+    MemorySelectionProof,
+    NativeMemoryCompiler,
+    mount_memory_sidecar,
+)
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
 from train_gemma4_memory_compiler import FORMAT, TEST_QUERIES, Fact, facts
@@ -70,7 +74,14 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
         native_page = _native_page(model, tokenizer, mounted, fact)
         page = mounted.freeze_layers(compiler(native_page))
         compiled_pages[fact.fact_id] = page
-        mounted.activate(page, proof_id=f"proof:replay:{fact.fact_id}:{page.page_id}")
+        mounted.activate(
+            page,
+            proof=MemorySelectionProof.for_page(
+                page,
+                proof_id=f"proof:replay:{fact.fact_id}:{page.page_id}",
+                fact_snapshot_id="memory-compiler-replay-fixture",
+            ),
+        )
         for query_index, template in enumerate(TEST_QUERIES):
             response = _generate(model, tokenizer, template.format(key=fact.key))
             evaluations.append(
@@ -94,7 +105,14 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
             if candidate.value != fact.value
         )
         page = compiled_pages[wrong_fact.fact_id]
-        mounted.activate(page, proof_id=f"proof:replay-wrong:{fact.fact_id}")
+        mounted.activate(
+            page,
+            proof=MemorySelectionProof.for_page(
+                page,
+                proof_id=f"proof:replay-wrong:{fact.fact_id}",
+                fact_snapshot_id="memory-compiler-wrong-page-fixture",
+            ),
+        )
         response = _generate(model, tokenizer, TEST_QUERIES[0].format(key=fact.key))
         wrong_page_original_value += response == fact.value
         mounted.deactivate()

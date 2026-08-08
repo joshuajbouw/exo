@@ -16,6 +16,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from gemma4_memory_sidecar_mlx import (
     MemoryPage,
+    MemorySelectionProof,
     NativeMemoryCompiler,
     mount_memory_sidecar,
     save_memory_page,
@@ -251,7 +252,11 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
             page = pages[(fact.fact_id, statement_form)]
             mounted.activate(
                 page,
-                proof_id=f"proof:conversation:{fact.fact_id}:{statement_form}:{page.page_id}",
+                proof=MemorySelectionProof.for_page(
+                    page,
+                    proof_id=f"proof:conversation:{fact.fact_id}:{statement_form}:{page.page_id}",
+                    fact_snapshot_id="conversation-training-fixture",
+                ),
             )
             for query_form, template in enumerate(TEST_QUERIES):
                 response = _generate(
@@ -280,7 +285,12 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
         )
         wrong_page = pages[(wrong_fact.fact_id, 0)]
         mounted.activate(
-            wrong_page, proof_id=f"proof:wrong:{fact.fact_id}:{wrong_page.page_id}"
+            wrong_page,
+            proof=MemorySelectionProof.for_page(
+                wrong_page,
+                proof_id=f"proof:wrong:{fact.fact_id}:{wrong_page.page_id}",
+                fact_snapshot_id="conversation-wrong-page-fixture",
+            ),
         )
         query = TEST_QUERIES[0].format(entity=fact.entity)
         wrong_response = _generate(model, tokenizer, query)

@@ -17,6 +17,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from gemma4_memory_sidecar_mlx import (
     MemoryPage,
+    MemorySelectionProof,
     NativeMemoryCompiler,
     mount_memory_sidecar,
 )
@@ -177,7 +178,14 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
         layers = compiler(native_pages[fact.fact_id])
         page = mounted.freeze_layers(layers)
         frozen_pages[fact.fact_id] = page
-        mounted.activate(page, proof_id=f"proof:{fact.fact_id}:{page.page_id}")
+        mounted.activate(
+            page,
+            proof=MemorySelectionProof.for_page(
+                page,
+                proof_id=f"proof:{fact.fact_id}:{page.page_id}",
+                fact_snapshot_id="serevin-training-fixture",
+            ),
+        )
         for query_index, template in enumerate(TEST_QUERIES):
             response = _generate(model, tokenizer, template.format(key=fact.key))
             evaluations.append(
@@ -200,7 +208,14 @@ def run(model_path: Path, output_dir: Path) -> dict[str, object]:
             if candidate.value != fact.value
         )
         page = frozen_pages[wrong_fact.fact_id]
-        mounted.activate(page, proof_id=f"proof:wrong:{fact.fact_id}:{page.page_id}")
+        mounted.activate(
+            page,
+            proof=MemorySelectionProof.for_page(
+                page,
+                proof_id=f"proof:wrong:{fact.fact_id}:{page.page_id}",
+                fact_snapshot_id="serevin-wrong-page-fixture",
+            ),
+        )
         response = _generate(model, tokenizer, TEST_QUERIES[0].format(key=fact.key))
         wrong_page_correct += response == fact.value
         mounted.deactivate()

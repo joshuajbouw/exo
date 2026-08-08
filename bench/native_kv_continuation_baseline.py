@@ -1,6 +1,10 @@
 # type: ignore
 #!/usr/bin/env python3
-"""Prove exact native-KV conversation memory across process death."""
+"""Measure exact native-KV continuation across process death.
+
+This is a hot-computation baseline, not a long-term-memory experiment. The
+normative distinction is defined in ``bench/MEMORY_CONTRACT.md``.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ from exo.worker.engines.mlx.utils_mlx import apply_chat_template
 from exo.worker.runner.bootstrap import logger
 
 _FIRST_RESPONSE_ID = "native-memory-source"
-_RUNTIME_PROFILE = "gemma4-native-kv-conversation-memory-v1"
+_RUNTIME_PROFILE = "gemma4-native-kv-continuation-baseline-v1"
 
 
 def _arguments() -> argparse.Namespace:
@@ -276,7 +280,9 @@ def _orchestrate(args: argparse.Namespace, workdir: Path) -> None:
         and cached_tokens > 0
     )
     output = {
-        "experiment": "native-kv-conversation-memory",
+        "experiment": "native-kv-continuation-baseline",
+        "claim_scope": "hot-continuation-cache-only",
+        "long_term_memory_claim": False,
         "model": str(args.model),
         "runtime_profile": _RUNTIME_PROFILE,
         "source_identity": hashlib.sha256(source.encode()).hexdigest(),

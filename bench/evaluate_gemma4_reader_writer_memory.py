@@ -12,6 +12,7 @@ from pathlib import Path
 import mlx.core as mx
 from gemma4_memory_sidecar_mlx import (
     AddressableMemoryAdapter,
+    MemorySelectionProof,
     load_memory_page,
     mount_memory_sidecar,
 )
@@ -56,7 +57,13 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
     if bank.page_id != training_result["bank_id"]:
         raise ValueError("serialized bank identity differs from the training record")
     mounted.activate(
-        bank, proof_id=f"proof:fresh-reader-writer:{bank.page_id}", reader=adapter
+        bank,
+        proof=MemorySelectionProof.for_page(
+            bank,
+            proof_id=f"proof:fresh-reader-writer:{bank.page_id}",
+            fact_snapshot_id="fresh-reader-writer-fixture",
+        ),
+        reader=adapter,
     )
 
     evaluations: list[dict[str, object]] = []
