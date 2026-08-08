@@ -882,6 +882,71 @@ high-level output properties without weight updates. Those results do not
 establish capability isolation, canonical identity, or proof-bound selection;
 those remain this design's claim and test burden.
 
+## Native continuation memory: pre-registration
+
+The sidecar experiments attempted to teach Gemma a second memory language even
+though the model already exposes its own exact continuation state: the native
+attention K/V cache. The next experiment therefore removes training entirely.
+It asks whether Exo can make one ordinary conversation survive process death by
+persisting that native state and restoring it for an append-only turn.
+
+The fixed gate is:
+
+- Gemma receives one natural user turn defining a fresh opaque term and emits a
+  completed assistant turn through the ordinary Exo MLX generator;
+- the completed native K/V frontier is published through
+  `StoreKVPrefixPersistence`, and the writer process also produces an
+  uninterrupted reference answer to a later natural question;
+- the writer process exits before recall, destroying all process-local cache;
+- a new process loads unchanged Gemma and receives only the new question and
+  the prior response identity through Exo's normal `previous_response_id`
+  continuation path;
+- the source turn is not supplied to the reader process and is never prefetched
+  again. The persisted token frontier is allowed as identity and positional
+  metadata, but only the restored native K/V tensors carry the prefix through
+  model execution;
+- restored and uninterrupted runs must have identical output token ids and
+  identical selected-token log-probability bit patterns for the full answer;
+- the response must report a non-zero cached-token count, proving the public
+  continuation path used the durable frontier rather than silently rebuilding
+  the transcript; and
+- a fresh no-memory control receives the same question and must not reproduce
+  the reference token sequence.
+
+The harness records checkpoint bytes, restore time, time to first token, cached
+tokens, and output tokens. Passing proves exact model-specific continuation
+memory across process death. It does not prove associative recall, portable
+weights, compression, or an unbounded context: native K/V still grows with the
+retained frontier and remains subject to the model's positional semantics.
+
+Failure ends this mechanism at the first mismatched token or log-probability.
+No tolerance, semantic scoring, prompt change, or learned repair is permitted
+under this experiment identity.
+
+### Native continuation result: passed
+
+Three independent source terms and values passed after correcting the harness
+to close durable publication before the reference question was ever computed.
+The reader stores therefore contained only the completed source turn, not a
+memoized question prefix.
+
+Across all three runs, a newly loaded Gemma process produced the same complete
+answer token sequence and the same selected-token log-probability bits as the
+uninterrupted process. The restored path reused 64--66 source-frontier tokens;
+the no-memory controls instead stated that the invented value was unavailable.
+The stores occupied 116.4--120.1 MB, or approximately 1.82 MB per cached token.
+Projection identity verification took 5.6--6.7 ms and MLX cache loading took
+less than 1 ms. Restored time to first token was 1.52--1.55 seconds, versus
+1.33--1.38 seconds for the already-hot uninterrupted process; this comparison
+includes fresh-process/device warm-up and is not a cache-load measurement.
+
+This establishes exact native continuation memory across process death without
+training or replaying source tokens through Gemma. It also quantifies why raw
+K/V is a correctness baseline rather than archival memory: the representation
+is exact and immediately usable, but linear and large. The next mechanism may
+page, quantize, or derive compact representations, but must always retain this
+exact path as its reference and fail-secure fallback.
+
 ## Stop conditions
 
 Stop rather than tuning the claim if any of these occurs:
