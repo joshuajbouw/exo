@@ -12,8 +12,12 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
-from gemma4_memory_sidecar_mlx import MemorySelectionProof, mount_memory_sidecar
 from mlx_lm import load
+
+from exo.worker.engines.mlx.latent_memory import (
+    LatentMemorySelection,
+    mount_latent_memory,
+)
 
 
 def _digest(array: mx.array) -> str:
@@ -36,7 +40,7 @@ def run(model_path: Path, prompt: str, memory_text: str) -> dict[str, object]:
     base_logits = _last_logits(model, tokens)
     base_seconds = time.perf_counter() - base_started
 
-    mounted = mount_memory_sidecar(
+    mounted = mount_latent_memory(
         model,
         model_id="mlx-community/gemma-4-31b-it-4bit",
         runtime_profile="mlx-0.32.0-mlx-lm-0.31.3-sidecar-v1",
@@ -51,24 +55,20 @@ def run(model_path: Path, prompt: str, memory_text: str) -> dict[str, object]:
     page = mounted.compile_page(slot_embeddings)
     compile_seconds = time.perf_counter() - compile_started
 
-    mounted.activate(
-        page,
-        proof=MemorySelectionProof.for_page(
-            page,
-            proof_id="proof:gemma4-memory-sidecar-probe",
-            fact_snapshot_id="sidecar-probe-fixture",
-        ),
+    selection = LatentMemorySelection(
+        "proof:gemma4-memory-sidecar-probe",
+        "sidecar-probe-fixture",
+        page.page_id,
     )
-    active_started = time.perf_counter()
-    active_logits = _last_logits(model, tokens)
-    active_seconds = time.perf_counter() - active_started
+    with mounted.activation(page, selection):
+        active_started = time.perf_counter()
+        active_logits = _last_logits(model, tokens)
+        active_seconds = time.perf_counter() - active_started
 
-    cache = model.make_cache()
-    model(tokens, cache=cache)
-    mx.eval(*[value for entry in cache for value in entry.state])
-    cache_offsets = [entry.offset for entry in cache]
-
-    mounted.deactivate()
+        cache = model.make_cache()
+        model(tokens, cache=cache)
+        mx.eval(*[value for entry in cache for value in entry.state])
+        cache_offsets = [entry.offset for entry in cache]
     revoked_started = time.perf_counter()
     revoked_logits = _last_logits(model, tokens)
     revoked_seconds = time.perf_counter() - revoked_started

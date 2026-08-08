@@ -1101,6 +1101,46 @@ typed concept identity. Mapping arbitrary present-tense English and goals to
 grounded relations remains Mimir/Huginn work, not a function of the storage or
 latent-page mechanism.
 
+## Production-mount replay: passed
+
+The accepted page format and separate-attention mechanism were moved from the
+benchmark harness into `src/exo/worker/engines/mlx/latent_memory.py`. The
+production mount accepts only an upstream selection bound to the exact page,
+checks the page bytes, model, runtime profile, layer order, gate, and tensor
+shape, and holds activation exclusively for one generator lifetime. Enabling
+the resolver currently selects Exo's sequential generator; heterogeneous
+latent pages are not admitted to the ordinary batch path.
+
+The conversation-memory artifacts were rebuilt under the original registered
+case digest
+`85e24c89fa50544261e653b7e190c354860a82f2d84f2b90e447ebe20d7197b1`.
+The frozen writer reached 32/32 exact recall, 0/8 base recall, 0/8 wrong-page
+false recall, and 8/8 exact inactive restoration. Its 655,360 parameters had
+digest
+`1c629ac8eeff1000f2a3c1b09f64267ecef284247dfc9c0fcbdb31d1c0d7d718`.
+
+That process then exited. A fresh Gemma 4 process loaded all sixteen serialized
+pages through the production Exo loader and reproduced 32/32 exact recall with
+all sixteen page identities stable and 0/8 wrong-page false recall. The
+production evaluator supplies no source statement, source token ids,
+historical conversational K/V, memory operation, candidate list, or routing
+hint to Gemma.
+
+The sixteen page files occupy 49,517,584 bytes total: 3,094,849 bytes on
+average, with a 3,033,409--3,197,249-byte range. This validates the production
+execution boundary, not representation efficiency. Compression, fewer memory
+sites, and smaller learned page forms require prospective experiments; the
+current result must not be described as compact long-term memory.
+
+A real-model production-path probe provided a narrow execution-cost check. For
+the same three-token input after model warm-up, inactive execution took 74.7 ms
+and a ten-slot page took 77.6 ms (3.9% slower in this single sample). The page
+changed the logits, revocation restored the exact inactive digest, and every
+ordinary cache offset remained three: the ten memory slots consumed no prompt
+or conversational-K/V positions. The 184.2 ms first base call was device
+warm-up and is not a comparison result. A sampled distribution over realistic
+prompt and page sizes is still required before making a latency claim.
+
 ## Typed-interface router control: VOID
 
 An invalid follow-on experiment supplied zero-page Gemma with a system-prompt

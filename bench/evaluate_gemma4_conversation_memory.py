@@ -9,11 +9,6 @@ import hashlib
 import json
 from pathlib import Path
 
-from gemma4_memory_sidecar_mlx import (
-    MemorySelectionProof,
-    load_memory_page,
-    mount_memory_sidecar,
-)
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_sampler
 from train_gemma4_conversation_memory import (
@@ -22,6 +17,12 @@ from train_gemma4_conversation_memory import (
     RUNTIME_PROFILE,
     TEST_QUERIES,
     facts,
+)
+
+from exo.worker.engines.mlx.latent_memory import (
+    LatentMemorySelection,
+    load_latent_memory_page,
+    mount_latent_memory,
 )
 
 
@@ -52,7 +53,7 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
         raise ValueError("writer digest differs from the training record")
 
     model, tokenizer = load(str(model_path))
-    mounted = mount_memory_sidecar(
+    mounted = mount_latent_memory(
         model, model_id=MODEL_ID, runtime_profile=RUNTIME_PROFILE
     )
     test_facts = tuple(fact for fact in facts() if fact.split == "test")
@@ -65,31 +66,30 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
     for page_record in page_records:
         fact = fact_by_id[page_record["fact_id"]]
         statement_form = page_record["statement_form"]
-        page = load_memory_page(artifact_dir / page_record["path"])
+        page = load_latent_memory_page(artifact_dir / page_record["path"])
         loaded_pages[(fact.fact_id, statement_form)] = page
         stable_page_ids += page.page_id == page_record["page_id"]
-        mounted.activate(
-            page,
-            proof=MemorySelectionProof.for_page(
-                page,
-                proof_id=f"proof:fresh-process:{fact.fact_id}:{statement_form}:{page.page_id}",
-                fact_snapshot_id="conversation-memory-replay-fixture",
-            ),
+        selection = LatentMemorySelection(
+            f"proof:fresh-process:{fact.fact_id}:{statement_form}:{page.page_id}",
+            "conversation-memory-replay-fixture",
+            page.page_id,
         )
-        for query_form, template in enumerate(TEST_QUERIES):
-            response = _generate(model, tokenizer, template.format(entity=fact.entity))
-            evaluations.append(
-                {
-                    "fact_id": fact.fact_id,
-                    "statement_form": statement_form,
-                    "query_form": query_form,
-                    "expected": fact.value,
-                    "response": response,
-                    "correct": response == fact.value,
-                    "page_id": page.page_id,
-                }
-            )
-        mounted.deactivate()
+        with mounted.activation(page, selection):
+            for query_form, template in enumerate(TEST_QUERIES):
+                response = _generate(
+                    model, tokenizer, template.format(entity=fact.entity)
+                )
+                evaluations.append(
+                    {
+                        "fact_id": fact.fact_id,
+                        "statement_form": statement_form,
+                        "query_form": query_form,
+                        "expected": fact.value,
+                        "response": response,
+                        "correct": response == fact.value,
+                        "page_id": page.page_id,
+                    }
+                )
 
     wrong_page_original_value = 0
     for index, fact in enumerate(test_facts):
@@ -99,19 +99,16 @@ def run(model_path: Path, artifact_dir: Path) -> dict[str, object]:
             if candidate.value != fact.value
         )
         page = loaded_pages[(wrong_fact.fact_id, 0)]
-        mounted.activate(
-            page,
-            proof=MemorySelectionProof.for_page(
-                page,
-                proof_id=f"proof:fresh-wrong:{fact.fact_id}",
-                fact_snapshot_id="conversation-wrong-page-fixture",
-            ),
+        selection = LatentMemorySelection(
+            f"proof:fresh-wrong:{fact.fact_id}",
+            "conversation-wrong-page-fixture",
+            page.page_id,
         )
-        response = _generate(
-            model, tokenizer, TEST_QUERIES[0].format(entity=fact.entity)
-        )
+        with mounted.activation(page, selection):
+            response = _generate(
+                model, tokenizer, TEST_QUERIES[0].format(entity=fact.entity)
+            )
         wrong_page_original_value += response == fact.value
-        mounted.deactivate()
 
     correct = sum(bool(row["correct"]) for row in evaluations)
     replay = {
