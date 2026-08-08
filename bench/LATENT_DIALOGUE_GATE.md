@@ -156,3 +156,19 @@ new entity/value assignments over the writer's trained answer vocabulary, not
 open-vocabulary episodic memory. A general latent-memory writer requires a new
 prospectively registered training distribution and cannot be obtained by
 relabeling this run or relaxing exact scoring.
+
+### Post-gate exploratory observation
+
+After the fixed gate was scored and frozen, each page was mounted in another
+fresh model process and given one open-ended reconstruction request. These
+questions were not registered acceptance cases and do not alter the score:
+
+| Mounted page | Request | Response |
+|---|---|---|
+| identity | reconstruct the prior speaker and self-description | `AMBER` |
+| preferences/events | recall preferences, workstation, benchmark, and key | `AMBER` |
+| revision/state | reconstruct final recovery, holder, and meeting state | `COCO` |
+
+The pages therefore do not encode a presently usable episode that can be
+reconstructed open-endedly by this writer. The observation reinforces the
+narrow-attractor determination above.
