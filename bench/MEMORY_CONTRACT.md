@@ -99,6 +99,10 @@ The current evidence proves:
   memories and fresh Gemma recalled 16/16 withheld natural-language queries.
   Wrong concepts, revoked grants, domain mismatch, expired epochs, and page
   substitution all failed safely.
+- The same eight pages and their canonical catalog survived writer-process
+  death in Astrid's durable object store. A fresh reader with no source-artifact
+  path reconstructed and identity-checked the closure before reproducing 16/16
+  recall.
 - Revocation restores the exact unpaged path.
 - Separately, native conversational K/V can survive process death and produce
   exact continuation. That is a hot-cache result only.
@@ -137,6 +141,10 @@ the authority-bearing page selector.
 - `evaluate_gemma4_conversation_memory.py`: fresh-process latent recall.
 - `evaluate_grounded_conversation_memory.py`: end-to-end authoritative
   selection and fresh-process recall with unrelated-corpus controls.
+- `durable_grounded_memory.py`: root-last publication and verified reopen over
+  Astrid's computation-store adapter.
+- `evaluate_durable_grounded_memory.py`: two-process durable publication and
+  latent-recall gate with no source-artifact path in the reader.
 - `neural_parameter_pages.py`: capability-scoped deterministic page selection.
 - `native_kv_continuation_baseline.py`: exact hot-continuation control.
 - `NEURAL_PARAMETER_PAGES.md`: chronological experiment registrations and

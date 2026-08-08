@@ -1039,6 +1039,68 @@ The evaluated catalog was an in-process canonical view over verified page
 artifacts; publishing the same records through Astrid's durable object store is
 integration work, not a property established by this run.
 
+## Durable grounded-memory reopen: pre-registration
+
+The next integration removes that final caveat without changing the selector
+or model experiment. The eight canonical latent pages and their catalog records
+are published through the existing Astrid computation-store adapter. Page
+content is admitted before a canonical catalog manifest, and the manifest is
+durable before its domain root is advanced. The root is the sole authoritative
+publication point.
+
+The fixed gate is:
+
+- a writer process verifies all page identities, publishes their bytes, writes
+  one canonically ordered manifest binding content object identity and physical
+  digest, then advances the privacy-domain catalog root;
+- the writer exits and a fresh reader process opens only the Astrid store—not
+  the original page artifact paths;
+- the reader canonical-decodes and identity-checks the manifest, reconstructs
+  each page through verified content reads, rechecks its latent page identity,
+  builds the grounded selector, and scores 16/16 on the existing natural-query
+  gate;
+- a missing, corrupt, non-canonical, object-substituted, or digest-substituted
+  manifest/page fails closed before mounting;
+- a failed publication before root advancement leaves the preceding catalog
+  readable; and
+- source statements, source token ids, and historical conversational K/V remain
+  absent.
+
+Passing establishes durable Astrid-backed page and catalog survival across
+process death. It does not establish arbitrary English grounding or a final
+production catalog update protocol; concurrent writers and incremental catalog
+trees remain later integration work.
+
+### Durable grounded-memory reopen result: passed
+
+One writer process published the eight frozen latent pages and a canonical
+privacy-domain catalog through Astrid's computation-store adapter, then exited.
+A separately started reader received the model path and durable-store path but
+not the original page-artifact directory. It recovered manifest
+`d005a297de851cef4bda1224193ad93543b9f6c4d2a18dc870efaf28158d3615`,
+verified every content object, physical digest, latent page identity, model id,
+and runtime profile, and reproduced 16/16 recall over the held-out natural
+questions.
+
+Publishing the eight pages and advancing the catalog root took 0.423 seconds.
+Verified reopen and projection took 0.088 seconds. The authoritative store used
+25,275,789 bytes for the roughly 24 MiB selected-page closure; the separate
+24 MiB projection is disposable compatibility state, not a second
+authoritative copy.
+
+The reader received no source statements, source token ids, or historical
+conversational K/V. Unit gates additionally rejected missing and non-canonical
+manifests, missing pages, substituted object identities, and substituted
+physical digests. An injected failure while advancing the domain root left the
+previously published catalog readable, confirming that the root is the only
+publication point.
+
+This closes the durable-storage caveat from the preceding experiment. It does
+not close the remaining semantic boundary: the invocation still supplied the
+typed concept identity. Mapping arbitrary present-tense English and goals to
+grounded relations remains Mimir/Huginn work, not a function of the storage or
+latent-page mechanism.
+
 ## Stop conditions
 
 Stop rather than tuning the claim if any of these occurs:
