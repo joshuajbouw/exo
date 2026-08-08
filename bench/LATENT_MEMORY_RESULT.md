@@ -400,6 +400,26 @@ The evidence does not yet support these stronger statements:
 - that Gemma can safely select memories by itself; or
 - that latent pages replace authoritative durable evidence.
 
+## Subsequent dialogue generalization result
+
+After the result above was recorded, the frozen writer was tested unchanged on
+three multi-turn conversations containing identity, preferences, events,
+revision, and state transfer. Values were deliberately outside the original
+eight-word calibration vocabulary. The formation process exited and a fresh
+production-mounted model scored 0/12 exact, with 0/12 base and 0/3 wrong-page
+controls.
+
+The correct pages nevertheless produced page-related fragments such as
+`MARBLE` for `MARBLE-COMET`, `LANTERN` for `LANTERN-BLUE`, and `CINDER` when
+asked which recovery word was obsolete. This is evidence of latent influence,
+not successful binding or recall.
+
+The formal determination is therefore narrower than “general dialogue
+memory”: the demonstrated compiler learned a reusable reader for unseen
+entity/value assignments within its trained answer domain. It did not learn an
+open-vocabulary episodic encoding. The failed gate and all raw responses are
+recorded in [`LATENT_DIALOGUE_GATE.md`](LATENT_DIALOGUE_GATE.md).
+
 ## Implementation and reproduction map
 
 - Production page format and attention mount:

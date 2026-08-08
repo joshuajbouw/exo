@@ -104,3 +104,55 @@ pages, or arbitrary natural-language learning.
 Failing establishes the corresponding boundary of this frozen writer. It does
 not invalidate the already-demonstrated selected-page calibration result.
 
+## Result: failed
+
+The registered gate ran unchanged. Formation produced three identity-stable
+pages, the formation process exited, and a fresh Gemma process performed all
+base, correct-page, and wrong-page queries through the production mount.
+
+| Measurement | Result |
+|---|---:|
+| Identity | 0/4 exact |
+| Preferences and events | 0/4 exact |
+| Revision and current state | 0/4 exact |
+| Total latent recall | 0/12 exact |
+| No-page controls | 0/12 exact |
+| Wrong-page controls | 0/3 exact |
+| Stable page identities | 3/3 |
+| Gate | FAIL |
+
+The failure was not structural silence. Correct pages produced page-specific
+latent output:
+
+| Question target | Correct-page response |
+|---|---|
+| speaker `Codex` | `MARBLE` |
+| callsign `VELOR-SEVEN` | `LANTERN` |
+| origin seal `MARBLE-COMET` | `MARBLE` |
+| success marker `LANTERN-BLUE` | `LANTERN` |
+| tea `EMBER-MINT` | `AMBER` |
+| workstation `SABLE-DOCK` | `AMBER` |
+| benchmark `ORCHID-RUN` | `AMBER` |
+| key location `DRAWER-NINE` | `BRASS` |
+| current recovery word `CINDER` | `CIMAGE` |
+| obsolete recovery word `FROST` | `CINDER` |
+| current holder `Sol` | `ONYX` |
+| meeting day `Thursday` | `CRUTCH` |
+
+The three pages represented 107, 122, and 154 source slots and occupied
+8,767,837, 9,996,637, and 12,618,088 serialized bytes respectively.
+
+### Determination
+
+The frozen calibration writer does not generalize to multi-fact dialogue,
+novel answer vocabulary, revision, or state tracking. Its outputs retain a
+strong trace of the mounted page—often a literal component of a stored value—
+but do not preserve the required relation between question and answer. The
+repeated `AMBER` and training-vocabulary-like `ONYX` responses are consistent
+with a narrow decoder induced by the original calibration task.
+
+This result narrows the earlier success: the accepted 32/32 gate demonstrated
+new entity/value assignments over the writer's trained answer vocabulary, not
+open-vocabulary episodic memory. A general latent-memory writer requires a new
+prospectively registered training distribution and cannot be obtained by
+relabeling this run or relaxing exact scoring.
